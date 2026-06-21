@@ -92,7 +92,7 @@ impl Configuration {
             heap_arr.as_mut().unwrap().as_mut_slice()
         };
         // Reverse sort.
-        matched.sort_by(|a, b| b.index.cmp(&a.index));
+        matched.sort_by_key(|w| std::cmp::Reverse(w.index));
 
         let quorum = crate::majority(matched.len());
         let quorum_index = matched[quorum - 1];

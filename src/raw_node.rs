@@ -28,7 +28,7 @@ use slog::Logger;
 
 use crate::eraftpb::{ConfState, Entry, EntryType, HardState, Message, MessageType, Snapshot};
 use crate::errors::{Error, Result};
-use crate::read_only::ReadState;
+use crate::read_only::{ReadOnlyOption, ReadState};
 use crate::{config::Config, StateRole};
 use crate::{storage::GetEntriesFor, GetEntriesContext, Raft, SoftState, Status, Storage};
 
@@ -73,6 +73,8 @@ fn is_response_msg(t: MessageType) -> bool {
             | MessageType::MsgHeartbeatResponse
             | MessageType::MsgUnreachable
             | MessageType::MsgRequestPreVoteResponse
+            | MessageType::MsgAskReadLeaseResp
+            | MessageType::MsgAskAckIndexResp
     )
 }
 
@@ -768,6 +770,48 @@ impl<T: Storage> RawNode<T> {
         e.data = rctx.into();
         m.set_entries(vec![e].into());
         let _ = self.raft.step(m);
+    }
+
+    /// Like `read_index`, but sets a given `switch_index` hint in the `commit` field.
+    /// Typically this will be `u64::MAX` as a "switch hasn't stamped yet" sentinel.
+    pub fn read_index_switch_hint(&mut self, rctx: Vec<u8>, switch_index: u64) {
+        let mut m = Message::default();
+        m.set_msg_type(MessageType::MsgReadIndex);
+        let mut e = Entry::default();
+        e.data = rctx.into();
+        m.set_entries(vec![e].into());
+        m.commit = switch_index;
+        let _ = self.raft.step(m);
+    }
+
+    /// Whether this node asks the leader for follower read leases.
+    pub fn is_asking_for_read_lease(&self) -> bool {
+        self.raft.read_only.option == ReadOnlyOption::GrantLeases
+            && self.raft.read_only.lease_config.ask_for_lease
+    }
+
+    /// Pumps the follower read-index delayer, releasing any held reads whose
+    /// commit index has caught up (served locally) or whose local-hold deadline
+    /// has elapsed (forwarded to the leader). Returns `true` if any read was
+    /// released, meaning a `Ready` is worth collecting.
+    ///
+    /// raft-rs has no timer thread, so the give-up deadline is only enforced when the delayer is
+    /// pumped. It is pumped automatically on every commit advance and on each
+    /// `tick()`.
+    /// A wrapper that wants the deadline honored at finer granularity
+    /// than its tick interval should run a timer that calls this on the same
+    /// thread that drives the rest of the `RawNode`.
+    pub fn fire_read_index_delays(&mut self) -> bool {
+        self.raft.fire_delayed_read_index_requests()
+    }
+
+    /// The earliest give-up instant (in `now_micros()` clock domain) among reads
+    /// the delayer is currently holding, or `None` if none are held. A wrapper
+    /// driving a precise give-up timer should arm the timer to this value, computing the
+    /// delay as `next.saturating_sub(now_micros())` against the same monotonic
+    /// clock, rather than polling `fire_read_index_delays()` blindly.
+    pub fn next_read_index_delay_micros(&self) -> Option<u64> {
+        self.raft.read_only.next_read_index_delay_micros()
     }
 
     /// Returns the store as an immutable reference.

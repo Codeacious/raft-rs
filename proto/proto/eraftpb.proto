@@ -66,6 +66,10 @@ enum MessageType {
     MsgReadIndexResp = 16;
     MsgRequestPreVote = 17;
     MsgRequestPreVoteResponse = 18;
+    MsgAskReadLease = 19;
+    MsgAskReadLeaseResp = 20;
+    MsgAskAckIndex = 21;
+    MsgAskAckIndexResp = 22;
 }
 
 message Message {

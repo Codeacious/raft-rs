@@ -33,7 +33,10 @@ use slog::{debug, error, info, o, trace, warn};
 
 use super::errors::{Error, Result, StorageError};
 use super::raft_log::RaftLog;
-use super::read_only::{ReadOnly, ReadOnlyOption, ReadState};
+use super::read_only::{
+    ReadLease, ReadOnly, ReadOnlyOption, ReadState, LEASE_RENEWAL_THRESHOLD_MICROS,
+    READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD,
+};
 use super::storage::{GetEntriesContext, GetEntriesFor, Storage};
 use super::Config;
 use crate::confchange::Changer;
@@ -341,7 +344,7 @@ impl<T: Storage> Raft<T> {
                 promotable: false,
                 check_quorum: c.check_quorum,
                 pre_vote: c.pre_vote,
-                read_only: ReadOnly::new(c.read_only_option),
+                read_only: ReadOnly::new(c.read_only_option, c.read_lease_config()),
                 heartbeat_timeout: c.heartbeat_tick,
                 election_timeout: c.election_tick,
                 leader_id: Default::default(),
@@ -937,7 +940,19 @@ impl<T: Storage> Raft<T> {
     /// Attempts to advance the commit index. Returns true if the commit index
     /// changed (in which case the caller should call `r.bcast_append`).
     pub fn maybe_commit(&mut self) -> bool {
-        let mci = self.mut_prs().maximal_committed_index().0;
+        let mut mci = self.mut_prs().maximal_committed_index().0;
+        // GrantLeases: the leader must not advance commit past the minimum
+        // acked index across the read leases it has handed out.
+        if self.read_only.option == ReadOnlyOption::GrantLeases
+            && !self.read_only.lease_map.leases.is_empty()
+        {
+            let min_acked = self.read_only.lease_map.min_acked_index();
+            let clamped = mci.min(min_acked);
+            if clamped < mci {
+                self.ask_lease_holders_for_ack_index();
+            }
+            mci = clamped;
+        }
         if self.r.raft_log.maybe_commit(mci, self.r.term) {
             let (self_id, committed) = (self.id, self.raft_log.committed);
             self.mut_prs()
@@ -947,6 +962,201 @@ impl<T: Storage> Raft<T> {
             return true;
         }
         false
+    }
+
+    /// Sends `MsgAskAckIndex` to every active lease holder so they report a
+    /// fresher acked index. Called when the leader can't advance commit due to
+    /// read lease holders.
+    /// TODO: This could only send messages for leaseholders that were behind the desired commit index.
+    fn ask_lease_holders_for_ack_index(&mut self) {
+        if self.read_only.option != ReadOnlyOption::GrantLeases {
+            return;
+        }
+        let ids: Vec<u64> = self.read_only.lease_map.leases.keys().copied().collect();
+        for id in ids {
+            let mut m = Message::default();
+            m.set_msg_type(MessageType::MsgAskAckIndex);
+            m.to = id;
+            self.r.send(m, &mut self.msgs);
+        }
+    }
+
+    /// Leader handler for `MsgAskReadLease`: grants a read lease to the asking
+    /// follower when the grant conditions hold, replying with `MsgAskReadLeaseResp`
+    /// carrying the 48-byte marshalled lease in `entries[0].data`.
+    fn handle_ask_read_lease(&mut self, m: &Message) {
+        let committed = self.raft_log.committed;
+        let grant = self.read_only.option == ReadOnlyOption::GrantLeases
+            // 1. request is for the current term
+            && self.term == m.term
+            // 2. the follower's log is up to date (within the catch-up margin)
+            && committed <= m.index.saturating_add(self.read_only.lease_config.catchup_margin)
+            // 3. we have spare lease capacity, or already lease this follower
+            && {
+                let max = self.read_only.lease_config.max_leases;
+                self.read_only.lease_map.num_active_leases() < max
+                    || self.read_only.lease_map.has_active_lease(m.from)
+            };
+
+        let mut resp = Message::default();
+        resp.set_msg_type(MessageType::MsgAskReadLeaseResp);
+        resp.to = m.from;
+        resp.index = committed;
+        resp.set_entries(vec![Entry::default()].into());
+        if grant {
+            // ack index seeds from what the leader already knows the follower
+            // holds: max(m.index, pr.matched).
+            let pr_match = self.prs().get(m.from).map_or(0, |pr| pr.matched);
+            let ack_index = cmp::max(m.index, pr_match);
+            // The lease id is follower-minted and arrives in m.log_term.
+            let duration = self.read_only.lease_config.duration_micros;
+            let lease = self.read_only.lease_map.grant_new_lease(
+                m.from,
+                m.log_term,
+                ack_index,
+                committed,
+                duration,
+            );
+            resp.reject = false;
+            resp.mut_entries()[0].data = lease.marshal().to_vec().into();
+        } else {
+            resp.reject = true;
+        }
+        self.r.send(resp, &mut self.msgs);
+    }
+
+    /// Leader handler for `MsgAskAckIndexResp`: updates the asking follower's
+    /// acked index and, if that follower was the commit bottleneck, tries to
+    /// advance the commit index.
+    fn handle_ask_ack_index_resp(&mut self, m: &Message) {
+        if self.read_only.option != ReadOnlyOption::GrantLeases {
+            return;
+        }
+        let old_index = match self.read_only.lease_map.get(m.from) {
+            Some(rl) => rl.acked_index,
+            None => return,
+        };
+        let min_before = self.read_only.lease_map.min_acked_index();
+        self.read_only.lease_map.update_acked_index(m.from, m.index);
+
+        if old_index == min_before && self.maybe_commit() {
+            self.bcast_append();
+        }
+    }
+
+    /// Follower path: ask the leader for a (renewed) read lease when the current
+    /// lease is near expiry (or absent) and the rate-limiter permits.
+    /// The lease id is minted locally and carried in `MsgAskReadLease.log_term`.
+    fn maybe_ask_for_read_lease(&mut self) {
+        if self.read_only.option != ReadOnlyOption::GrantLeases || self.leader_id == INVALID_ID {
+            return;
+        }
+        let self_id = self.id;
+        let until_expired = self.read_only.micros_until_lease_expired(self_id);
+        if until_expired >= LEASE_RENEWAL_THRESHOLD_MICROS || !self.read_only.can_ask_for_lease() {
+            return;
+        }
+        let lease_id = self.read_only.get_marked_lease_id(self_id);
+        let committed = self.raft_log.committed;
+        let leader = self.leader_id;
+        let mut m = Message::default();
+        m.set_msg_type(MessageType::MsgAskReadLease);
+        m.to = leader;
+        m.from = self_id;
+        m.index = committed;
+        m.log_term = lease_id;
+        self.r.send(m, &mut self.msgs);
+        info!(
+            self.logger,
+            "{id} sending MsgAskReadLease to leader {leader} (leaseId: {lease_id})",
+            id = self_id,
+            leader = leader,
+            lease_id = lease_id;
+        );
+        self.read_only.mark_asked_for_lease();
+    }
+
+    /// Follower handling of a `MsgReadIndex` under `GrantLeases`: serve the read
+    /// locally from our lease when commit has caught up, hold it in the delayer
+    /// when commit is close enough to catch up shortly, or forward it to the
+    /// leader otherwise.
+    fn serve_read_index_with_lease(&mut self, m: Message) {
+        let self_id = self.id;
+        let committed = self.raft_log.committed;
+        let until_expired = self.read_only.micros_until_lease_expired(self_id);
+        let lease = self
+            .read_only
+            .get_read_lease(self_id)
+            .map(|rl| (rl.log_index, rl.acked_index));
+
+        // No usable lease, so forward to the leader.
+        let (log_index, acked_index) = match lease {
+            Some(info) if until_expired > 0 => info,
+            _ => return self.forward_read_index(m),
+        };
+        if log_index > committed {
+            return self.forward_read_index(m);
+        }
+
+        // The switch hint rides in m.commit; u64::MAX means the switch hasn't
+        // stamped this message but a hint was expected. 0 means no hint.
+        let hint = if m.commit == u64::MAX { 0 } else { m.commit };
+        // m.index != 0 is the delayed-read replay hook.
+        let can_serve = (acked_index <= committed && (hint == 0 || hint <= committed))
+            || (m.index != 0 && m.index <= committed);
+        if can_serve {
+            if let Some(resp) = self.handle_ready_read_index(m, committed) {
+                self.msgs.push(resp);
+            }
+            self.read_only.mark_read_index_query_stat(true);
+            return;
+        }
+
+        // Not caught up yet. Hold the read locally and let the delayer
+        // re-evaluate it as commit advances, but only when
+        // the required index is within the hold log-distance threshold and this
+        // is not a timed-out replay (`reject`); otherwise forward to the leader.
+        let required = cmp::max(hint, acked_index);
+        let within_threshold = required
+            .checked_sub(committed)
+            .is_some_and(|d| d <= READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD);
+        if !m.reject && within_threshold {
+            self.read_only.add_delayed_read_index_req(m, required);
+        } else {
+            self.forward_read_index(m);
+        }
+    }
+
+    /// Forwards a `MsgReadIndex` to the leader and records that it was not served locally.
+    fn forward_read_index(&mut self, mut m: Message) {
+        m.to = self.leader_id;
+        self.r.send(m, &mut self.msgs);
+        self.read_only.mark_read_index_query_stat(false);
+    }
+
+    /// Pumps the read-index delayer and replays any reads it releases by
+    /// re-`step`ping them: a read whose required commit index has been reached
+    /// is served locally, and one held past its deadline is forwarded to the
+    /// leader. Returns `true` if any read was replayed.
+    ///
+    /// This is the raft-rs analogue of the Go fork re-injecting fired reads into
+    /// the node loop. Because raft-rs has no timer
+    /// thread, this function has to be used in two places: the tail of `step` and `tick()` .
+    /// For full-resolution give-up latency, the wrapper should drive it via
+    /// `RawNode::fire_read_index_delays()` via a real timer.
+    pub(crate) fn fire_delayed_read_index_requests(&mut self) -> bool {
+        if self.read_only.option != ReadOnlyOption::GrantLeases
+            || self.read_only.delayed_read_index_reqs.is_empty()
+        {
+            return false;
+        }
+        let committed = self.raft_log.committed;
+        let ready = self.read_only.fire_delayed_read_index_requests(committed);
+        let fired = !ready.is_empty();
+        for m in ready {
+            let _ = self.step(m);
+        }
+        fired
     }
 
     /// Commit that the Raft peer has applied up to the given index.
@@ -1020,7 +1230,7 @@ impl<T: Storage> Raft<T> {
         self.prs.reset_votes();
 
         self.pending_conf_index = 0;
-        self.read_only = ReadOnly::new(self.read_only.option);
+        self.read_only = ReadOnly::new(self.read_only.option, self.read_only.lease_config.clone());
         self.pending_request_snapshot = INVALID_INDEX;
 
         let last_index = self.raft_log.last_index();
@@ -1088,12 +1298,19 @@ impl<T: Storage> Raft<T> {
 
     /// Returns true to indicate that there will probably be some readiness need to be handled.
     pub fn tick(&mut self) -> bool {
-        match self.state {
+        let mut has_ready = match self.state {
             StateRole::Follower | StateRole::PreCandidate | StateRole::Candidate => {
                 self.tick_election()
             }
             StateRole::Leader => self.tick_heartbeat(),
+        };
+        // Backstop the read-index delayer's give-up deadline. raft-rs has no
+        // timer thread, so without this a held read whose commit never advances
+        // would not be forwarded until the next incoming append/heartbeat.
+        if self.fire_delayed_read_index_requests() {
+            has_ready = true;
         }
+        has_ready
     }
 
     // TODO: revoke pub when there is a better way to test.
@@ -1533,6 +1750,10 @@ impl<T: Storage> Raft<T> {
                 StateRole::Leader => self.step_leader(m)?,
             },
         }
+        // Central read-index delayer pump. In raft-rs the follower's commit index
+        // only advances as a synchronous side-effect of stepping a message.
+        // The recursive `step()` called from re-enqueuing these requests will get an empty set here.
+        self.fire_delayed_read_index_requests();
         Ok(())
     }
 
@@ -2080,6 +2301,19 @@ impl<T: Storage> Raft<T> {
                     );
                     return Err(Error::ProposalDropped);
                 }
+                // A freshly-elected leader under GrantLeases must wait out a full
+                // lease window before accepting writes, so any lease a prior leader
+                // granted has provably expired.
+                if self.read_only.option == ReadOnlyOption::GrantLeases
+                    && !self.read_only.safeguard_has_passed()
+                {
+                    debug!(
+                        self.logger,
+                        "[term {term}] read-only lease safeguard has not passed; dropping proposal",
+                        term = self.term;
+                    );
+                    return Err(Error::ProposalDropped);
+                }
 
                 for (i, e) in m.mut_entries().iter_mut().enumerate() {
                     let mut cc;
@@ -2173,7 +2407,7 @@ impl<T: Storage> Raft<T> {
                             .add_request(self.r.raft_log.committed, m, self.r.id);
                         self.bcast_heartbeat_with_ctx(Some(ctx));
                     }
-                    ReadOnlyOption::LeaseBased => {
+                    ReadOnlyOption::LeaseBased | ReadOnlyOption::GrantLeases => {
                         let read_index = self.raft_log.committed;
                         if let Some(m) = self.handle_ready_read_index(m, read_index) {
                             self.r.send(m, &mut self.msgs);
@@ -2200,6 +2434,12 @@ impl<T: Storage> Raft<T> {
             }
             MessageType::MsgTransferLeader => {
                 self.handle_transfer_leader(&m);
+            }
+            MessageType::MsgAskReadLease => {
+                self.handle_ask_read_lease(&m);
+            }
+            MessageType::MsgAskAckIndexResp => {
+                self.handle_ask_ack_index_resp(&m);
             }
             _ => {
                 if self.prs().get(m.from).is_none() {
@@ -2425,8 +2665,15 @@ impl<T: Storage> Raft<T> {
                     );
                     return Ok(());
                 }
-                m.to = self.leader_id;
-                self.r.send(m, &mut self.msgs);
+                if self.read_only.option == ReadOnlyOption::GrantLeases {
+                    self.serve_read_index_with_lease(m);
+                    // Fire on every read in GrantLeases mode, served or not.
+                    // TODO: Make this toggleable.
+                    self.maybe_ask_for_read_lease();
+                } else {
+                    m.to = self.leader_id;
+                    self.r.send(m, &mut self.msgs);
+                }
             }
             MessageType::MsgReadIndexResp => {
                 if m.entries.len() != 1 {
@@ -2447,6 +2694,97 @@ impl<T: Storage> Raft<T> {
                 // the log entry in the leader's commit index will always have the leader's current term,
                 // because the leader only handle MsgReadIndex after it has committed log entry in its term.
                 self.raft_log.maybe_commit(m.index, m.term);
+            }
+            MessageType::MsgAskReadLeaseResp => {
+                if m.entries.len() != 1 {
+                    error!(
+                        self.logger,
+                        "invalid format of MsgAskReadLeaseResp from {}",
+                        m.from;
+                        "entries count" => m.entries.len(),
+                    );
+                    return Ok(());
+                }
+                if m.reject {
+                    info!(
+                        self.logger,
+                        "request for read lease was rejected by leader {}",
+                        m.from;
+                    );
+                    return Ok(());
+                }
+                let bytes: [u8; 48] = match (&m.entries[0].data[..]).try_into() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        warn!(
+                            self.logger,
+                            "failed to unmarshal read lease from {}",
+                            m.from;
+                            "data len" => m.entries[0].data.len(),
+                        );
+                        return Ok(());
+                    }
+                };
+                let read_lease = ReadLease::unmarshal(&bytes);
+                if read_lease.node_id != self.id {
+                    warn!(
+                        self.logger,
+                        "received read lease for different node {node} from {from}",
+                        node = read_lease.node_id,
+                        from = m.from;
+                    );
+                    return Ok(());
+                }
+                let (lease_id, leader) = (read_lease.lease_id, m.from);
+                match self.read_only.process_granted_lease(read_lease) {
+                    Some(rl) => info!(
+                        self.logger,
+                        "granted read lease from leader {leader} (leaseId: {lease_id})",
+                        leader = leader,
+                        lease_id = lease_id;
+                        "lease" => ?rl,
+                    ),
+                    None => info!(
+                        self.logger,
+                        "got read lease from leader {leader}, but dropped it \
+                         (no matching pending leaseId {lease_id})",
+                        leader = leader,
+                        lease_id = lease_id;
+                    ),
+                }
+            }
+            MessageType::MsgAskAckIndex => {
+                if self.read_only.option != ReadOnlyOption::GrantLeases {
+                    warn!(
+                        self.logger,
+                        "received unexpected MsgAskAckIndex from {}",
+                        m.from;
+                    );
+                    return Ok(());
+                }
+                let self_id = self.id;
+                let mut resp = Message::default();
+                resp.set_msg_type(MessageType::MsgAskAckIndexResp);
+                resp.to = m.from;
+                resp.from = self_id;
+                resp.index = 0;
+                if self.read_only.has_active_read_lease(self_id) {
+                    let last_index = self.raft_log.last_index();
+                    self.read_only.mark_node_acked_index(self_id, last_index);
+                    resp.index = self
+                        .read_only
+                        .get_read_lease(self_id)
+                        .map(|l| l.acked_index)
+                        .unwrap_or(0);
+                }
+                let ack_index = resp.index;
+                self.r.send(resp, &mut self.msgs);
+                info!(
+                    self.logger,
+                    "sending MsgAskAckIndexResp to {to} for ack index {ack_index}",
+                    to = m.from,
+                    ack_index = ack_index;
+                );
             }
             _ => {}
         }
@@ -2511,6 +2849,11 @@ impl<T: Storage> Raft<T> {
             to_send.to = m.from;
             to_send.index = self.raft_log.committed;
             to_send.commit = self.raft_log.committed;
+            // GrantLeases: record our (already-committed) index as this node's acked index.
+            if self.read_only.option == ReadOnlyOption::GrantLeases {
+                let (self_id, committed) = (self.id, self.raft_log.committed);
+                self.read_only.mark_node_acked_index(self_id, committed);
+            }
             self.r.send(to_send, &mut self.msgs);
             return;
         }
@@ -2524,6 +2867,11 @@ impl<T: Storage> Raft<T> {
             .maybe_append(m.index, m.log_term, m.commit, &m.entries)
         {
             to_send.set_index(last_idx);
+            // GrantLeases: our log advanced; record it as this node's acked index.
+            if self.read_only.option == ReadOnlyOption::GrantLeases {
+                let self_id = self.id;
+                self.read_only.mark_node_acked_index(self_id, last_idx);
+            }
         } else {
             debug!(
                 self.logger,
@@ -2561,6 +2909,14 @@ impl<T: Storage> Raft<T> {
     /// For a message, commit and send out heartbeat.
     pub fn handle_heartbeat(&mut self, mut m: Message) {
         self.raft_log.commit_to(m.commit);
+        // GrantLeases: a heartbeat advances our commit, so record it as our
+        // acked index and renew the lease if it's near expiry.
+        if self.read_only.option == ReadOnlyOption::GrantLeases {
+            let committed = self.raft_log.committed;
+            let self_id = self.id;
+            self.read_only.mark_node_acked_index(self_id, committed);
+            self.maybe_ask_for_read_lease();
+        }
         if self.pending_request_snapshot != INVALID_INDEX {
             self.send_request_snapshot();
             return;
@@ -2589,6 +2945,11 @@ impl<T: Storage> Raft<T> {
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.to = m.from;
             to_send.index = self.raft_log.last_index();
+            // GrantLeases: the snapshot advanced our commit; record it as this node's acked index.
+            if self.read_only.option == ReadOnlyOption::GrantLeases {
+                let (self_id, last_index) = (self.id, self.raft_log.last_index());
+                self.read_only.mark_node_acked_index(self_id, last_index);
+            }
             self.r.send(to_send, &mut self.msgs);
         } else {
             info!(
@@ -2602,6 +2963,11 @@ impl<T: Storage> Raft<T> {
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.to = m.from;
             to_send.index = self.raft_log.committed;
+            // GrantLeases: record our (unchanged) commit as this node's acked index.
+            if self.read_only.option == ReadOnlyOption::GrantLeases {
+                let (self_id, committed) = (self.id, self.raft_log.committed);
+                self.read_only.mark_node_acked_index(self_id, committed);
+            }
             self.r.send(to_send, &mut self.msgs);
         }
     }
@@ -2713,6 +3079,22 @@ impl<T: Storage> Raft<T> {
     /// such as reacting to the removal of nodes or changed quorum requirements.
     pub fn post_conf_change(&mut self) -> ConfState {
         info!(self.logger, "switched to configuration"; "config" => ?self.prs.conf());
+        // Evict read leases held by nodes no longer in the configuration.
+        // `self.prs` already reflects the new config here,
+        // so drop any lease whose holder is absent from it.
+        if self.read_only.option == ReadOnlyOption::GrantLeases {
+            let to_remove: Vec<u64> = self
+                .read_only
+                .lease_map
+                .leases
+                .keys()
+                .copied()
+                .filter(|id| !self.prs.progress().contains_key(id))
+                .collect();
+            for id in to_remove {
+                self.read_only.lease_map.leases.remove(&id);
+            }
+        }
         // TODO: instead of creating a conf state, validating conf state inside
         // progress tracker is better.
         let cs = self.prs.conf().to_conf_state();

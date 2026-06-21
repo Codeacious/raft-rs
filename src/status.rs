@@ -17,6 +17,7 @@
 use crate::eraftpb::HardState;
 
 use crate::raft::{Raft, SoftState, StateRole};
+use crate::read_only::ReadLeaseStats;
 use crate::storage::Storage;
 use crate::ProgressTracker;
 
@@ -33,6 +34,8 @@ pub struct Status<'a> {
     pub applied: u64,
     /// The progress towards catching up and applying logs.
     pub progress: Option<&'a ProgressTracker>,
+    /// Read-lease observability counters (reads served via a lease vs. total).
+    pub read_lease_stats: ReadLeaseStats,
 }
 
 impl<'a> Status<'a> {
@@ -48,6 +51,7 @@ impl<'a> Status<'a> {
         if s.ss.raft_state == StateRole::Leader {
             s.progress = Some(raft.prs());
         }
+        s.read_lease_stats = raft.read_only.read_lease_stats;
         s
     }
 }

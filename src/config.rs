@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use super::read_only::ReadOnlyOption;
+pub use super::read_only::{ReadLeaseConfig, ReadOnlyOption};
 use super::util::NO_LIMIT;
 use super::{
     errors::{Error, Result},
@@ -81,6 +81,22 @@ pub struct Config {
     /// Setting this to `LeaseBased` requires `check_quorum = true`.
     pub read_only_option: ReadOnlyOption,
 
+    /// Duration in microseconds that a follower read lease is valid for when
+    /// `read_only_option == GrantLeases`.
+    pub read_lease_duration_micros: u64,
+
+    /// Maximum number of outstanding read leases a leader will grant at once
+    /// when `read_only_option == GrantLeases`.
+    pub max_num_read_leases: usize,
+
+    /// Whether this node should ask the leader for read leases. The wrapping DB
+    /// flips this to `true` (only meaningful when `read_only_option == GrantLeases`).
+    pub ask_for_read_lease: bool,
+
+    /// Log-index margin a lease holder must stay within before its lease is
+    /// considered caught up, when `read_only_option == GrantLeases`.
+    pub read_lease_catchup_margin: u64,
+
     /// Don't broadcast an empty raft entry to notify follower to commit an entry.
     /// This may make follower wait a longer time to apply an entry. This configuration
     /// May affect proposal forwarding and follower read.
@@ -122,6 +138,10 @@ impl Default for Config {
             min_election_tick: 0,
             max_election_tick: 0,
             read_only_option: ReadOnlyOption::Safe,
+            read_lease_duration_micros: 500_000,
+            max_num_read_leases: 5,
+            ask_for_read_lease: false,
+            read_lease_catchup_margin: 10,
             skip_bcast_commit: false,
             batch_append: false,
             priority: 0,
@@ -139,6 +159,17 @@ impl Config {
         Self {
             id,
             ..Self::default()
+        }
+    }
+
+    /// Gathers the lease-related knobs into the `ReadLeaseConfig` that a
+    /// `ReadOnly` carries (and preserves across resets).
+    pub fn read_lease_config(&self) -> ReadLeaseConfig {
+        ReadLeaseConfig {
+            duration_micros: self.read_lease_duration_micros,
+            max_leases: self.max_num_read_leases,
+            ask_for_lease: self.ask_for_read_lease,
+            catchup_margin: self.read_lease_catchup_margin,
         }
     }
 
@@ -205,6 +236,18 @@ impl Config {
         if self.read_only_option == ReadOnlyOption::LeaseBased && !self.check_quorum {
             return Err(Error::ConfigInvalid(
                 "read_only_option == LeaseBased requires check_quorum == true".into(),
+            ));
+        }
+
+        if self.read_only_option == ReadOnlyOption::GrantLeases && !self.check_quorum {
+            return Err(Error::ConfigInvalid(
+                "read_only_option == GrantLeases requires check_quorum == true".into(),
+            ));
+        }
+
+        if self.ask_for_read_lease && self.read_only_option != ReadOnlyOption::GrantLeases {
+            return Err(Error::ConfigInvalid(
+                "ask_for_read_lease == true requires read_only_option == GrantLeases".into(),
             ));
         }
 
