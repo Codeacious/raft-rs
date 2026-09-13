@@ -18,8 +18,8 @@ use std::cmp;
 use std::ops::{Deref, DerefMut};
 
 use crate::eraftpb::{
-    ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
-    Snapshot,
+    ConfChange, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message,
+    MessageType, Snapshot,
 };
 use protobuf::Message as _;
 use raft_proto::ConfChangeI;
@@ -170,6 +170,12 @@ pub struct RaftCore<T: Storage> {
 
     /// The current read states.
     pub read_states: Vec<ReadState>,
+
+    /// `MsgReadIndex` messages received while this leader had not yet
+    /// committed an entry in its own term. Answered by
+    /// `release_pending_read_index_messages` once the first commit of the term
+    /// lands. Not cleared by `reset()`.
+    pending_read_index_messages: Vec<Message>,
 
     /// The persistent log.
     pub raft_log: RaftLog<T>,
@@ -336,6 +342,7 @@ impl<T: Storage> Raft<T> {
             r: RaftCore {
                 id: c.id,
                 read_states: Default::default(),
+                pending_read_index_messages: Default::default(),
                 raft_log: RaftLog::new(store, logger.clone(), c),
                 max_inflight: c.max_inflight_msgs,
                 max_msg_size: c.max_size_per_msg,
@@ -937,10 +944,56 @@ impl<T: Storage> Raft<T> {
             .for_each(|(id, pr)| core.send_heartbeat(*id, pr, ctx.clone(), msgs));
     }
 
+    /// Whether the new-leader safeguard has lifted, by timer or by the
+    /// confirmation shortcut (every node that could hold a prior-term lease has
+    /// been heard from at this term). Callers use this;
+    /// `ReadOnly::safeguard_has_passed` is only the timer half. The required
+    /// set is the current configuration plus any node named by an unapplied
+    /// conf change (see `scan_unapplied_conf_changes`).
+    pub(crate) fn new_leader_safeguard_passed(&mut self) -> bool {
+        if self.read_only.option != ReadOnlyOption::GrantLeases {
+            return true;
+        }
+        if self.read_only.safeguard_has_passed() {
+            return true;
+        }
+        if self.read_only.safeguard_scan_failed() {
+            return false;
+        }
+        let self_id = self.id;
+        let confirmed = |id: &u64| *id == self_id || self.read_only.is_confirmed_at_term(*id);
+        if !self.prs.progress().keys().all(confirmed)
+            || !self
+                .read_only
+                .extra_required_confirmations()
+                .iter()
+                .all(confirmed)
+        {
+            return false;
+        }
+        info!(
+            self.logger,
+            "new-leader read-lease safeguard lifted early: every node that could \
+             hold a prior-term lease has been heard from at term {term}",
+            term = self.term;
+        );
+        // Latch, so a later configuration change cannot re-close the window.
+        self.read_only.mark_safeguard_passed();
+        true
+    }
+
     /// Attempts to advance the commit index. Returns true if the commit index
     /// changed (in which case the caller should call `r.bcast_append`).
     pub fn maybe_commit(&mut self) -> bool {
         let mut mci = self.mut_prs().maximal_committed_index().0;
+        // GrantLeases: a freshly-elected leader commits nothing until the
+        // safeguard window has elapsed — including the election no-op, which
+        // would commit the whole prior-term tail with it.
+        if self.read_only.option == ReadOnlyOption::GrantLeases
+            && !self.new_leader_safeguard_passed()
+        {
+            return false;
+        }
         // GrantLeases: the leader must not advance commit past the minimum
         // acked index across the read leases it has handed out.
         if self.read_only.option == ReadOnlyOption::GrantLeases
@@ -949,7 +1002,7 @@ impl<T: Storage> Raft<T> {
             let min_acked = self.read_only.lease_map.min_acked_index();
             let clamped = mci.min(min_acked);
             if clamped < mci {
-                self.ask_lease_holders_for_ack_index();
+                self.ask_lease_holders_for_ack_index(mci);
             }
             mci = clamped;
         }
@@ -959,20 +1012,41 @@ impl<T: Storage> Raft<T> {
                 .get_mut(self_id)
                 .unwrap()
                 .update_committed(committed);
+            // A read postponed for want of a current-term commit may now be
+            // answerable.
+            self.release_pending_read_index_messages();
             return true;
         }
         false
     }
 
-    /// Sends `MsgAskAckIndex` to every active lease holder so they report a
-    /// fresher acked index. Called when the leader can't advance commit due to
-    /// read lease holders.
-    /// TODO: This could only send messages for leaseholders that were behind the desired commit index.
-    fn ask_lease_holders_for_ack_index(&mut self) {
+    /// Answers `MsgReadIndex` messages that were postponed because this leader
+    /// had not yet committed an entry in its own term. No-op until that first
+    /// commit lands, and cheap when the queue is empty.
+    fn release_pending_read_index_messages(&mut self) {
+        if self.r.pending_read_index_messages.is_empty() {
+            return;
+        }
+        if !self.commit_to_current_term() {
+            return;
+        }
+        let msgs = std::mem::take(&mut self.r.pending_read_index_messages);
+        for m in msgs {
+            let committed = self.raft_log.committed;
+            if let Some(resp) = self.handle_ready_read_index(m, committed, false) {
+                self.r.send(resp, &mut self.msgs);
+            }
+        }
+    }
+
+    /// Sends `MsgAskAckIndex` to the lease holders that are holding commit back
+    /// (acked index below `cutoff`) and have not been pinged within
+    /// `ACK_INDEX_ASK_INTERVAL_MICROS`. Called when the commit clamp bites.
+    fn ask_lease_holders_for_ack_index(&mut self, cutoff: u64) {
         if self.read_only.option != ReadOnlyOption::GrantLeases {
             return;
         }
-        let ids: Vec<u64> = self.read_only.lease_map.leases.keys().copied().collect();
+        let ids = self.read_only.lease_map.nodes_to_ask_for_ack(cutoff);
         for id in ids {
             let mut m = Message::default();
             m.set_msg_type(MessageType::MsgAskAckIndex);
@@ -989,9 +1063,16 @@ impl<T: Storage> Raft<T> {
         let grant = self.read_only.option == ReadOnlyOption::GrantLeases
             // 1. request is for the current term
             && self.term == m.term
-            // 2. the follower's log is up to date (within the catch-up margin)
+            // 2. this leader has committed in its own term, so `committed` is
+            //    the real commit index rather than a lower bound
+            && self.commit_to_current_term()
+            // 3. the asker is still a member (`prs()` includes learners)
+            && self.prs().get(m.from).is_some()
+            // 4. the asker is not being drained for removal
+            && !self.read_only.is_lease_banned(m.from)
+            // 5. the follower's log is up to date (within the catch-up margin)
             && committed <= m.index.saturating_add(self.read_only.lease_config.catchup_margin)
-            // 3. we have spare lease capacity, or already lease this follower
+            // 6. we have spare lease capacity, or already lease this follower
             && {
                 let max = self.read_only.lease_config.max_leases;
                 self.read_only.lease_map.num_active_leases() < max
@@ -1047,14 +1128,21 @@ impl<T: Storage> Raft<T> {
     /// Follower path: ask the leader for a (renewed) read lease when the current
     /// lease is near expiry (or absent) and the rate-limiter permits.
     /// The lease id is minted locally and carried in `MsgAskReadLease.log_term`.
-    fn maybe_ask_for_read_lease(&mut self) {
-        if self.read_only.option != ReadOnlyOption::GrantLeases || self.leader_id == INVALID_ID {
-            return;
+    /// Returns `true` if a `MsgAskReadLease` was produced (so the wrapper knows a
+    /// `Ready` is worth collecting when driving this from a renewal timer).
+    pub(crate) fn maybe_ask_for_read_lease(&mut self) -> bool {
+        // Not on a leader: after winning an election `leader_id` is this node's
+        // own id, so a still-armed renewal timer would ask itself for a lease.
+        if self.read_only.option != ReadOnlyOption::GrantLeases
+            || self.state == StateRole::Leader
+            || self.leader_id == INVALID_ID
+        {
+            return false;
         }
         let self_id = self.id;
         let until_expired = self.read_only.micros_until_lease_expired(self_id);
         if until_expired >= LEASE_RENEWAL_THRESHOLD_MICROS || !self.read_only.can_ask_for_lease() {
-            return;
+            return false;
         }
         let lease_id = self.read_only.get_marked_lease_id(self_id);
         let committed = self.raft_log.committed;
@@ -1074,6 +1162,7 @@ impl<T: Storage> Raft<T> {
             lease_id = lease_id;
         );
         self.read_only.mark_asked_for_lease();
+        true
     }
 
     /// Follower handling of a `MsgReadIndex` under `GrantLeases`: serve the read
@@ -1083,29 +1172,34 @@ impl<T: Storage> Raft<T> {
     fn serve_read_index_with_lease(&mut self, m: Message) {
         let self_id = self.id;
         let committed = self.raft_log.committed;
+
         let until_expired = self.read_only.micros_until_lease_expired(self_id);
-        let lease = self
-            .read_only
-            .get_read_lease(self_id)
-            .map(|rl| (rl.log_index, rl.acked_index));
+        let lease = self.read_only.get_read_lease(self_id).map(|rl| rl.log_index);
 
         // No usable lease, so forward to the leader.
-        let (log_index, acked_index) = match lease {
+        let log_index = match lease {
             Some(info) if until_expired > 0 => info,
             _ => return self.forward_read_index(m),
         };
+        // The node-global ack index, not the lease's copy: the lease's is only
+        // as fresh as the grant that installed it.
+        let acked_index = self.read_only.read_lease_acked_index();
         if log_index > committed {
             return self.forward_read_index(m);
         }
 
-        // The switch hint rides in m.commit; u64::MAX means the switch hasn't
-        // stamped this message but a hint was expected. 0 means no hint.
-        let hint = if m.commit == u64::MAX { 0 } else { m.commit };
+        // `m.commit` is an extra index this node must have committed before it
+        // may serve the read from its own lease; 0 is the sole reserved value
+        // and means no extra requirement. An unreachable index needs no case of
+        // its own: it fails the serve test and exceeds the hold threshold, so
+        // the read forwards. See `RawNode::read_index_switch_hint`.
+        let hint = m.commit;
         // m.index != 0 is the delayed-read replay hook.
         let can_serve = (acked_index <= committed && (hint == 0 || hint <= committed))
             || (m.index != 0 && m.index <= committed);
         if can_serve {
-            if let Some(resp) = self.handle_ready_read_index(m, committed) {
+            // The only site that serves a read from this node's own lease.
+            if let Some(resp) = self.handle_ready_read_index(m, committed, true) {
                 self.msgs.push(resp);
             }
             self.read_only.mark_read_index_query_stat(true);
@@ -1116,6 +1210,10 @@ impl<T: Storage> Raft<T> {
         // re-evaluate it as commit advances, but only when
         // the required index is within the hold log-distance threshold and this
         // is not a timed-out replay (`reject`); otherwise forward to the leader.
+        //
+        // `checked_sub`, not `-`: an unreachable required index must forward,
+        // never be held — a held read is replayed with `m.index` set, which
+        // serves it.
         let required = cmp::max(hint, acked_index);
         let within_threshold = required
             .checked_sub(committed)
@@ -1139,11 +1237,9 @@ impl<T: Storage> Raft<T> {
     /// is served locally, and one held past its deadline is forwarded to the
     /// leader. Returns `true` if any read was replayed.
     ///
-    /// This is the raft-rs analogue of the Go fork re-injecting fired reads into
-    /// the node loop. Because raft-rs has no timer
-    /// thread, this function has to be used in two places: the tail of `step` and `tick()` .
-    /// For full-resolution give-up latency, the wrapper should drive it via
-    /// `RawNode::fire_read_index_delays()` via a real timer.
+    /// raft-rs has no timer thread, so this is driven from the tail of `step`,
+    /// from `tick()`, and — for full give-up resolution — by the wrapper via
+    /// `RawNode::fire_read_index_delays()`.
     pub(crate) fn fire_delayed_read_index_requests(&mut self) -> bool {
         if self.read_only.option != ReadOnlyOption::GrantLeases
             || self.read_only.delayed_read_index_reqs.is_empty()
@@ -1352,11 +1448,30 @@ impl<T: Storage> Raft<T> {
             return has_ready;
         }
 
+        // GrantLeases: advance phase 1 of the new-leader safeguard.
+        if self.read_only.option == ReadOnlyOption::GrantLeases {
+            self.read_only.tick_safeguard();
+        }
+
         if self.heartbeat_elapsed >= self.heartbeat_timeout {
             self.heartbeat_elapsed = 0;
             has_ready = true;
             let m = new_message(INVALID_ID, MessageType::MsgBeat, Some(self.id));
             let _ = self.step(m);
+        }
+
+        // GrantLeases: retry a commit the safeguard suppressed. Commit
+        // otherwise only advances on an append response, and those are consumed
+        // inside the window; with no write traffic afterwards the election no-op
+        // would never commit. `commit_to_current_term()` goes true the moment it
+        // does, so this is unreachable outside the window.
+        if self.read_only.option == ReadOnlyOption::GrantLeases
+            && !self.commit_to_current_term()
+            && self.new_leader_safeguard_passed()
+            && self.maybe_commit()
+        {
+            has_ready = true;
+            self.bcast_append();
         }
         has_ready
     }
@@ -1478,6 +1593,14 @@ impl<T: Storage> Raft<T> {
         // pending log entries, and scanning the entire tail of the log
         // could be expensive.
         self.pending_conf_index = last_index;
+
+        // GrantLeases: arm the two-phase safeguard and scan for unapplied conf
+        // changes, both before the no-op below is appended.
+        if self.read_only.option == ReadOnlyOption::GrantLeases {
+            let election_timeout = self.election_timeout;
+            self.read_only.start_new_leader_safeguard(election_timeout);
+            self.scan_unapplied_conf_changes();
+        }
 
         // No need to check result because append_entry never refuse entries
         // which size is zero
@@ -1697,6 +1820,27 @@ impl<T: Storage> Raft<T> {
         #[cfg(feature = "failpoints")]
         fail_point!("before_step");
 
+        // GrantLeases: a peer message at our current term proves the peer
+        // stepped to this term, which destroyed any lease it held. Allowlisted
+        // types only — local and synthetic messages carry no evidence about a
+        // remote node's term, and pre-vote responses carry the candidate's
+        // prospective term.
+        if self.read_only.option == ReadOnlyOption::GrantLeases
+            && m.term == self.term
+            && m.from != INVALID_ID
+            && m.from != self.id
+            && matches!(
+                m.get_msg_type(),
+                MessageType::MsgAppendResponse
+                    | MessageType::MsgHeartbeatResponse
+                    | MessageType::MsgRequestVoteResponse
+                    | MessageType::MsgAskAckIndexResp
+                    | MessageType::MsgAskReadLease
+            )
+        {
+            self.read_only.confirm_at_term(m.from);
+        }
+
         match m.get_msg_type() {
             MessageType::MsgHup => self.hup(false),
             MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
@@ -1798,6 +1942,114 @@ impl<T: Storage> Raft<T> {
             self.campaign(CAMPAIGN_PRE_ELECTION);
         } else {
             self.campaign(CAMPAIGN_ELECTION);
+        }
+    }
+
+    /// Bans every `RemoveNode` target in `entries` from being granted a read
+    /// lease for the rest of this term, and returns the first such target that
+    /// currently holds an active lease, if any.
+    ///
+    /// Only `RemoveNode` counts; a demotion to learner keeps the node's
+    /// `Progress` and its lease.
+    fn removal_target_holding_lease(&mut self, entries: &[Entry]) -> Option<u64> {
+        let mut targets: Vec<u64> = Vec::new();
+        for e in entries {
+            let cc = match e.get_entry_type() {
+                EntryType::EntryConfChange => {
+                    let mut v1 = ConfChange::default();
+                    if v1.merge_from_bytes(e.get_data()).is_err() {
+                        continue;
+                    }
+                    v1.into_v2()
+                }
+                EntryType::EntryConfChangeV2 => {
+                    let mut v2 = ConfChangeV2::default();
+                    if v2.merge_from_bytes(e.get_data()).is_err() {
+                        continue;
+                    }
+                    v2
+                }
+                _ => continue,
+            };
+            for change in cc.get_changes() {
+                if change.get_change_type() == ConfChangeType::RemoveNode {
+                    targets.push(change.node_id);
+                }
+            }
+        }
+        let mut holder = None;
+        for id in targets {
+            self.read_only.ban_lease(id);
+            if holder.is_none() && self.read_only.has_active_read_lease(id) {
+                holder = Some(id);
+            }
+        }
+        holder
+    }
+
+    /// Scans the unapplied log tail for configuration changes, seeding the two
+    /// sets the new-leader safeguard depends on: every node id a conf change
+    /// names becomes an extra confirmation the shortcut must collect (an
+    /// unapplied addition is absent from `prs` but may hold a prior-term
+    /// lease), and every `RemoveNode` target is barred from being granted a
+    /// lease. Called once, from `become_leader`.
+    fn scan_unapplied_conf_changes(&mut self) {
+        let lo = self.raft_log.applied + 1;
+        let hi = self.raft_log.last_index() + 1;
+        if lo >= hi {
+            return;
+        }
+        let page_size = self.max_committed_size_per_ready;
+        let ctx = GetEntriesContext(GetEntriesFor::TransferLeader);
+        let mut required: Vec<u64> = Vec::new();
+        let mut banned: Vec<u64> = Vec::new();
+        let scan = self.raft_log.scan(lo, hi, page_size, ctx, |ents| {
+            for e in ents {
+                let cc = match e.get_entry_type() {
+                    EntryType::EntryConfChange => {
+                        let mut v1 = ConfChange::default();
+                        if v1.merge_from_bytes(e.get_data()).is_err() {
+                            continue;
+                        }
+                        v1.into_v2()
+                    }
+                    EntryType::EntryConfChangeV2 => {
+                        let mut v2 = ConfChangeV2::default();
+                        if v2.merge_from_bytes(e.get_data()).is_err() {
+                            continue;
+                        }
+                        v2
+                    }
+                    _ => continue,
+                };
+                for change in cc.get_changes() {
+                    required.push(change.node_id);
+                    if change.get_change_type() == ConfChangeType::RemoveNode {
+                        banned.push(change.node_id);
+                    }
+                }
+            }
+            true
+        });
+        if scan.is_err() {
+            // Entries above `applied` are never compacted, so this is a safety
+            // net; fall back to the full timer rather than a partial set.
+            error!(
+                self.logger,
+                "failed scanning unapplied entries [{lo}, {hi}) for conf changes; \
+                 new-leader safeguard shortcut disabled this term",
+                lo = lo,
+                hi = hi;
+                "error" => ?scan.unwrap_err(),
+            );
+            self.read_only.mark_safeguard_scan_failed();
+            return;
+        }
+        for id in required {
+            self.read_only.require_confirmation(id);
+        }
+        for id in banned {
+            self.read_only.ban_lease(id);
         }
     }
 
@@ -2037,6 +2289,13 @@ impl<T: Storage> Raft<T> {
             return;
         }
 
+        // GrantLeases: the append response is a fresher acked index for this
+        // holder than the commit clamp currently has.
+        if self.read_only.option == ReadOnlyOption::GrantLeases {
+            self.read_only.lease_map.update_acked_index(m.from, m.index);
+        }
+
+        let pr = self.prs.get_mut(m.from).unwrap();
         match pr.state {
             ProgressState::Probe => pr.become_replicate(),
             ProgressState::Snapshot => {
@@ -2122,7 +2381,7 @@ impl<T: Storage> Raft<T> {
         }
 
         for rs in self.r.read_only.advance(&m.context, &self.r.logger) {
-            if let Some(m) = self.handle_ready_read_index(rs.req, rs.index) {
+            if let Some(m) = self.handle_ready_read_index(rs.req, rs.index, false) {
                 self.r.send(m, &mut self.msgs);
             }
         }
@@ -2305,7 +2564,7 @@ impl<T: Storage> Raft<T> {
                 // lease window before accepting writes, so any lease a prior leader
                 // granted has provably expired.
                 if self.read_only.option == ReadOnlyOption::GrantLeases
-                    && !self.read_only.safeguard_has_passed()
+                    && !self.new_leader_safeguard_passed()
                 {
                     debug!(
                         self.logger,
@@ -2313,6 +2572,22 @@ impl<T: Storage> Raft<T> {
                         term = self.term;
                     );
                     return Err(Error::ProposalDropped);
+                }
+
+                // GrantLeases: a removed node keeps serving reads locally from
+                // a lease the leader can no longer reach, so bar every removal
+                // target from acquiring one and refuse the change while a
+                // target still holds one.
+                if self.read_only.option == ReadOnlyOption::GrantLeases {
+                    if let Some(holder) = self.removal_target_holding_lease(m.get_entries()) {
+                        info!(
+                            self.logger,
+                            "refusing conf change: {holder} still holds a read lease; \
+                             draining it first",
+                            holder = holder;
+                        );
+                        return Err(Error::ProposalDropped);
+                    }
                 }
 
                 for (i, e) in m.mut_entries().iter_mut().enumerate() {
@@ -2378,18 +2653,29 @@ impl<T: Storage> Raft<T> {
             }
             MessageType::MsgReadIndex => {
                 if !self.commit_to_current_term() {
-                    // Reject read only request when this leader has not committed any log entry
-                    // in its term.
-                    info!(
-                        self.logger,
-                        "leader has not yet committed in its term; dropping read index msg",
-                    );
+                    // `raft_log.committed` is only a lower bound until this
+                    // leader commits in its own term. Under GrantLeases the
+                    // safeguard makes that gap a full lease window, so postpone
+                    // the read instead of dropping it; the other options keep
+                    // the existing drop.
+                    if self.read_only.option == ReadOnlyOption::GrantLeases {
+                        info!(
+                            self.logger,
+                            "leader has not yet committed in its term; postponing read index msg",
+                        );
+                        self.r.pending_read_index_messages.push(m);
+                    } else {
+                        info!(
+                            self.logger,
+                            "leader has not yet committed in its term; dropping read index msg",
+                        );
+                    }
                     return Ok(());
                 }
 
                 if self.prs().is_singleton() {
                     let read_index = self.raft_log.committed;
-                    if let Some(m) = self.handle_ready_read_index(m, read_index) {
+                    if let Some(m) = self.handle_ready_read_index(m, read_index, false) {
                         self.r.send(m, &mut self.msgs);
                     }
                     return Ok(());
@@ -2409,7 +2695,7 @@ impl<T: Storage> Raft<T> {
                     }
                     ReadOnlyOption::LeaseBased | ReadOnlyOption::GrantLeases => {
                         let read_index = self.raft_log.committed;
-                        if let Some(m) = self.handle_ready_read_index(m, read_index) {
+                        if let Some(m) = self.handle_ready_read_index(m, read_index, false) {
                             self.r.send(m, &mut self.msgs);
                         }
                     }
@@ -2688,6 +2974,8 @@ impl<T: Storage> Raft<T> {
                 let rs = ReadState {
                     index: m.index,
                     request_ctx: m.take_entries()[0].take_data().to_vec(),
+                    // Answered by the leader, not a follower lease.
+                    served_by_follower_lease: false,
                 };
                 self.read_states.push(rs);
                 // `index` and `term` in MsgReadIndexResp is the leader's commit index and its current term,
@@ -2769,13 +3057,12 @@ impl<T: Storage> Raft<T> {
                 resp.from = self_id;
                 resp.index = 0;
                 if self.read_only.has_active_read_lease(self_id) {
+                    // Mark before reporting: the mark is the promise, so no
+                    // later grant can install an ack index below what the leader
+                    // now clamps commit on.
                     let last_index = self.raft_log.last_index();
                     self.read_only.mark_node_acked_index(self_id, last_index);
-                    resp.index = self
-                        .read_only
-                        .get_read_lease(self_id)
-                        .map(|l| l.acked_index)
-                        .unwrap_or(0);
+                    resp.index = self.read_only.read_lease_acked_index();
                 }
                 let ack_index = resp.index;
                 self.r.send(resp, &mut self.msgs);
@@ -3148,7 +3435,7 @@ impl<T: Storage> Raft<T> {
                 .is_some_and(|acks| prs.has_quorum(acks))
             {
                 for rs in self.r.read_only.advance(&ctx, &self.r.logger) {
-                    if let Some(m) = self.handle_ready_read_index(rs.req, rs.index) {
+                    if let Some(m) = self.handle_ready_read_index(rs.req, rs.index, false) {
                         self.r.send(m, &mut self.msgs);
                     }
                 }
@@ -3280,11 +3567,21 @@ impl<T: Storage> Raft<T> {
         self.r.send(m, &mut self.msgs);
     }
 
-    fn handle_ready_read_index(&mut self, mut req: Message, index: u64) -> Option<Message> {
+    /// Records a resolved read index locally, or builds the `MsgReadIndexResp`
+    /// for a remote requester. `served_by_follower_lease` marks an index this
+    /// node produced from its own read lease rather than one the leader
+    /// confirmed, and is recorded on the `ReadState`.
+    fn handle_ready_read_index(
+        &mut self,
+        mut req: Message,
+        index: u64,
+        served_by_follower_lease: bool,
+    ) -> Option<Message> {
         if req.from == INVALID_ID || req.from == self.id {
             let rs = ReadState {
                 index,
                 request_ctx: req.take_entries()[0].take_data().to_vec(),
+                served_by_follower_lease,
             };
             self.read_states.push(rs);
             return None;

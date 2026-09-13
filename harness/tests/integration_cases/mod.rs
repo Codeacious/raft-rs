@@ -5,3 +5,5 @@ mod test_raft_flow_control;
 mod test_raft_paper;
 mod test_raft_snap;
 mod test_raw_node;
+mod test_read_leases;
+mod test_switch_hint;

@@ -772,15 +772,21 @@ impl<T: Storage> RawNode<T> {
         let _ = self.raft.step(m);
     }
 
-    /// Like `read_index`, but sets a given `switch_index` hint in the `commit` field.
-    /// Typically this will be `u64::MAX` as a "switch hasn't stamped yet" sentinel.
-    pub fn read_index_switch_hint(&mut self, rctx: Vec<u8>, switch_index: u64) {
+    /// Like `read_index`, but carries an extra index requirement in the `commit`
+    /// field of the `MsgReadIndex`.
+    ///
+    /// `required_index` is an index this node must have committed before a lease
+    /// holder may serve this read locally; `0` — the only reserved value —
+    /// means no extra requirement. A caller that must not have the read served
+    /// locally at all passes an index this node cannot reach (`u64::MAX`), which
+    /// the follower gate's ordinary rules forward to the leader.
+    pub fn read_index_switch_hint(&mut self, rctx: Vec<u8>, required_index: u64) {
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgReadIndex);
         let mut e = Entry::default();
         e.data = rctx.into();
         m.set_entries(vec![e].into());
-        m.commit = switch_index;
+        m.commit = required_index;
         let _ = self.raft.step(m);
     }
 
@@ -796,8 +802,7 @@ impl<T: Storage> RawNode<T> {
     /// released, meaning a `Ready` is worth collecting.
     ///
     /// raft-rs has no timer thread, so the give-up deadline is only enforced when the delayer is
-    /// pumped. It is pumped automatically on every commit advance and on each
-    /// `tick()`.
+    /// pumped. It is pumped automatically on every commit advance and on each `tick()`.
     /// A wrapper that wants the deadline honored at finer granularity
     /// than its tick interval should run a timer that calls this on the same
     /// thread that drives the rest of the `RawNode`.
@@ -812,6 +817,80 @@ impl<T: Storage> RawNode<T> {
     /// clock, rather than polling `fire_read_index_delays()` blindly.
     pub fn next_read_index_delay_micros(&self) -> Option<u64> {
         self.raft.read_only.next_read_index_delay_micros()
+    }
+
+    /// Micros from *now* until the earliest read the delayer is holding must be
+    /// forwarded to the leader, or `None` if none are held. Unlike
+    /// `next_read_index_delay_micros` this is a relative duration in the wrapper's
+    /// own time base, so a wrapper can arm a precise timer with it directly.
+    pub fn next_read_index_delay_timeout_micros(&self) -> Option<u64> {
+        self.raft.read_only.next_read_index_delay_timeout_micros()
+    }
+
+    /// Relative micros from *now* until this node should next (re)ask the leader
+    /// for a read lease, for a wrapper arming a precise one-shot renewal timer on
+    /// the poller thread. `None` when lease renewal is not applicable — the
+    /// feature is off, or this node is the leader / has no known leader (a leader
+    /// serves reads directly and holds no follower lease). `Some(0)` = due now.
+    ///
+    /// Drives [`RawNode::maybe_renew_read_lease`]; renewal otherwise only fires
+    /// on an inbound heartbeat or read (`maybe_ask_for_read_lease`).
+    pub fn micros_until_lease_renewal_timeout_micros(&mut self) -> Option<u64> {
+        if !self.is_asking_for_read_lease()
+            || self.raft.state == StateRole::Leader
+            || self.raft.leader_id == crate::INVALID_ID
+        {
+            return None;
+        }
+        let self_id = self.raft.id;
+        Some(self.raft.read_only.micros_until_lease_renewal(self_id))
+    }
+
+    /// Ask the leader for a (renewed) read lease if the lease is near expiry (or
+    /// absent) and the rate-limiter permits. Returns `true` if a message was
+    /// produced (a `Ready` is worth collecting). The timer-driven analogue of the
+    /// heartbeat-triggered renewal, to be called on the same thread that drives
+    /// the rest of the `RawNode`.
+    pub fn maybe_renew_read_lease(&mut self) -> bool {
+        self.raft.maybe_ask_for_read_lease()
+    }
+
+    /// Relative micros until the soonest read lease this leader has granted is
+    /// due to expire, for a wrapper arming a precise lease-expiry cleanup timer
+    /// on the poller thread. `None` when not applicable (not a `GrantLeases`
+    /// leader, or holding no leases). `Some(0)` = a lease is already due to be
+    /// reaped.
+    ///
+    /// When it fires the wrapper calls
+    /// [`RawNode::expire_read_leases_and_maybe_commit`], which drops lapsed
+    /// leases from the min-acked commit clamp and advances commit.
+    pub fn micros_until_next_lease_expiry_timeout(&self) -> Option<u64> {
+        if self.raft.state != StateRole::Leader
+            || self.raft.read_only.option != ReadOnlyOption::GrantLeases
+        {
+            return None;
+        }
+        self.raft.read_only.lease_map.micros_until_soonest_expiry()
+    }
+
+    /// Reaps expired read leases (dropping them from the min-acked commit clamp)
+    /// and, if that released the clamp, advances the commit index and broadcasts
+    /// it. Returns `true` if commit advanced (a `Ready` is worth collecting).
+    /// Leader-side; driven by the wrapper's lease-expiry timer. The cleanup
+    /// recomputes the soonest-expiry cache, so the wrapper can re-arm after it.
+    pub fn expire_read_leases_and_maybe_commit(&mut self) -> bool {
+        if self.raft.state != StateRole::Leader
+            || self.raft.read_only.option != ReadOnlyOption::GrantLeases
+        {
+            return false;
+        }
+        self.raft.read_only.lease_map.cleanup_expired_leases();
+        if self.raft.maybe_commit() {
+            self.raft.bcast_append();
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns the store as an immutable reference.
