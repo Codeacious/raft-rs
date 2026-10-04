@@ -6,10 +6,10 @@
 //! node state (role, configuration) rather than on `ReadOnly` alone.
 
 use harness::*;
+use protobuf::Message as _;
 use raft::eraftpb::*;
 use raft::storage::MemStorage;
 use raft::*;
-use protobuf::Message as _;
 
 use std::time::Duration;
 
@@ -172,21 +172,13 @@ fn elect_leader(l: &slog::Logger) -> Interface {
     raft
 }
 
-/// Runs the new-leader safeguard's timer to completion: `election_timeout`
-/// ticks for phase 1, then past `lease_duration + drift` for phase 2.
+/// Runs the new-leader safeguard's timer to completion: past
+/// `lease_duration + drift` of wall clock. The safeguard has no tick phase, so
+/// ticking would pass no time at all; only sleeping lifts it.
 ///
 /// Node 3 is deliberately never heard from in these tests, so the confirmation
 /// shortcut stays blocked and it really is the timer being exercised.
 fn advance_past_safeguard(raft: &mut Interface) {
-    for _ in 0..raft.election_timeout() {
-        raft.tick();
-        // Keep node 2 recently-active, or CheckQuorum (mandatory under
-        // GrantLeases) steps this leader down exactly when phase 1 completes.
-        // Node 3 stays silent, so the confirmation shortcut remains blocked.
-        let mut hb = new_message(2, 1, MessageType::MsgHeartbeatResponse, 0);
-        hb.term = raft.term;
-        raft.step(hb).expect("step heartbeat response");
-    }
     std::thread::sleep(PAST_SAFEGUARD);
     raft.read_messages();
     assert_eq!(
@@ -224,16 +216,18 @@ fn test_leader_refuses_lease_to_non_member() {
     let term = raft.term;
     let committed = raft.raft_log.committed;
 
-    // A member in good standing is granted a lease...
+    // A member in good standing is granted a lease, once a majority has echoed
+    // a lease round minted after its request...
     raft.step(ask_read_lease(2, 1, term, committed, 0xAA))
         .expect("step member ask");
+    echo_latest_lease_round(&mut raft, 2);
     let granted = lease_resp(&mut raft, 2);
     assert!(
         !granted.reject,
         "a configuration member should have been granted a lease"
     );
     assert_eq!(
-        raft.read_only.lease_map.num_active_leases(),
+        raft.read_only.leader.granted_leases.num_active_leases(),
         1,
         "the member's lease should be recorded on the leader"
     );
@@ -252,18 +246,38 @@ fn test_leader_refuses_lease_to_non_member() {
         "a rejected grant must not carry a marshalled lease"
     );
     assert!(
-        raft.read_only.lease_map.get(9).is_none(),
+        raft.read_only.leader.granted_leases.get(9).is_none(),
         "the non-member's ask must not have created a lease"
     );
     assert!(
-        raft.read_only.lease_map.get(2).is_some(),
+        raft.read_only.leader.granted_leases.get(2).is_some(),
         "the member's lease should be the one that survived"
     );
     assert_eq!(
-        raft.read_only.lease_map.num_active_leases(),
+        raft.read_only.leader.granted_leases.num_active_leases(),
         1,
         "exactly one lease should be outstanding"
     );
+}
+
+/// Echoes the leader's latest lease round from `from`, as that follower's
+/// `MsgHeartbeatResponse` would. Drains the leader's messages exactly once to
+/// find the round, and returns them: a helper that drained twice would consume
+/// the round's heartbeat before it could be echoed.
+fn echo_latest_lease_round(raft: &mut Interface, from: u64) -> Vec<Message> {
+    let msgs = raft.read_messages();
+    let round = msgs
+        .iter()
+        .filter(|m| m.get_msg_type() == MessageType::MsgHeartbeat)
+        .map(|m| m.index)
+        .max()
+        .expect("the leader sent no lease round");
+    assert_ne!(round, 0, "a leased-mode heartbeat must carry a lease round");
+    let mut resp = new_message(from, 1, MessageType::MsgHeartbeatResponse, 0);
+    resp.term = raft.term;
+    resp.index = round;
+    raft.step(resp).expect("step lease echo");
+    msgs
 }
 
 /// Drains messages and returns the single `MsgAskReadLeaseResp` addressed to `to`.
@@ -335,7 +349,7 @@ fn test_leader_refuses_lease_before_committing_in_term() {
         "lease granted before the leader committed in its own term"
     );
     assert_eq!(
-        raft.read_only.lease_map.num_active_leases(),
+        raft.read_only.leader.granted_leases.num_active_leases(),
         0,
         "no lease should have been recorded"
     );
@@ -349,6 +363,7 @@ fn test_leader_refuses_lease_before_committing_in_term() {
     let committed = raft.raft_log.committed;
     raft.step(ask_read_lease(2, 1, term, committed, 0xBB))
         .expect("step member ask");
+    echo_latest_lease_round(&mut raft, 2);
     assert!(!lease_resp(&mut raft, 2).reject);
 }
 
@@ -412,10 +427,26 @@ fn test_read_during_safeguard_is_postponed_then_answered() {
         "read must not be answered against an unvalidated commit index"
     );
 
-    // It is held, not discarded: closing the window answers it.
+    // It is held, not discarded. Closing the window releases it into the
+    // same gate as a fresh read: with no self-lease yet, a heartbeat quorum
+    // round, which a majority's echo completes.
     advance_past_safeguard(&mut raft);
     ack_append_from(&mut raft, 2);
     assert!(raft.commit_to_current_term());
+    assert!(
+        raft.read_states.is_empty(),
+        "with no self-lease the released read must wait for a quorum round"
+    );
+    let round = raft
+        .read_messages()
+        .into_iter()
+        .find(|m| m.get_msg_type() == MessageType::MsgHeartbeat && !m.context.is_empty())
+        .expect("the released read should have gone out as a quorum round");
+    let mut ack = new_message(2, 1, MessageType::MsgHeartbeatResponse, 0);
+    ack.term = raft.term;
+    ack.context = round.context.clone();
+    ack.index = round.index;
+    raft.step(ack).expect("step read round ack");
 
     assert_eq!(
         raft.read_states.len(),
@@ -475,8 +506,9 @@ fn test_removal_of_lease_holder_is_refused_and_drains() {
     // Node 2 takes a lease.
     raft.step(ask_read_lease(2, 1, term, committed, 0xAA))
         .expect("step lease ask");
+    echo_latest_lease_round(&mut raft, 2);
     assert!(!lease_resp(&mut raft, 2).reject);
-    assert!(raft.read_only.lease_map.get(2).is_some());
+    assert!(raft.read_only.leader.granted_leases.get(2).is_some());
 
     // Removing it is refused while that lease is live.
     let mut propose = new_message(1, 1, MessageType::MsgPropose, 0);
@@ -506,6 +538,7 @@ fn test_removal_of_lease_holder_is_refused_and_drains() {
     // The ban is targeted: an unrelated member is unaffected.
     raft.step(ask_read_lease(3, 1, term, committed, 0xCC))
         .expect("step lease ask");
+    echo_latest_lease_round(&mut raft, 2);
     assert!(
         !lease_resp(&mut raft, 3).reject,
         "the ban should apply only to the removal target"

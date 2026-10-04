@@ -597,8 +597,9 @@ fn test_raw_node_read_index() {
     let wrs = vec![ReadState {
         index: 2u64,
         request_ctx: wrequest_ctx.clone(),
-        // ReadOnlySafe: no follower lease involved.
+        // ReadOnlySafe: no lease involved.
         served_by_follower_lease: false,
+        served_by_leader_lease: false,
     }];
 
     let s = new_storage();

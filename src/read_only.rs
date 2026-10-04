@@ -23,6 +23,8 @@ use std::time::Instant;
 use slog::Logger;
 
 use crate::eraftpb::Message;
+use crate::quorum::{AckedIndexer, Index};
+use crate::JointConfig;
 use crate::{HashMap, HashSet};
 
 /// Allowed clock drift for read leases.
@@ -33,8 +35,13 @@ pub(crate) const LEASE_ASK_INTERVAL_MICROS: u64 = 10_000; // 10ms
 /// Minimum interval between a leader's `MsgAskAckIndex` pings to the same lease
 /// holder.
 pub(crate) const ACK_INDEX_ASK_INTERVAL_MICROS: u64 = 5_000; // 5ms
-/// Followers renew their read lease once it's within this many microseconds of expiry.
-pub(crate) const LEASE_RENEWAL_THRESHOLD_MICROS: u64 = 150_000; // 150ms
+/// A lease (a follower's, or the leader's own) is renewed once it's within this
+/// many microseconds of expiry.
+pub(crate) const LEASE_RENEWAL_THRESHOLD_MICROS: u64 = 200_000; // 200ms
+/// A lease round that has not reached a majority after this long is presumed
+/// lost, and the next lease event may send another. Pacing only; never part of
+/// a safety decision.
+pub(crate) const LEASE_ROUND_RETRY_MICROS: u64 = 10_000; // 10ms
 /// Log index threshold for a read-lease follower deciding it's too far behind to
 /// serve a read locally, forwarding the read to the leader instead.
 pub(crate) const READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD: u64 = 100;
@@ -87,6 +94,14 @@ pub struct ReadState {
     /// `MsgReadIndexResp`. `false` for every non-`GrantLeases` path and for a
     /// leader's own reads.
     pub served_by_follower_lease: bool,
+    /// Whether this index came from **this leader's own self-lease** (either
+    /// leased option) rather than from a heartbeat quorum round. A lease-served
+    /// index is linearizable, but it contacted nobody after the read was
+    /// proposed, so it is not evidence that a quorum followed this leader at
+    /// that moment. A wrapper that renews a lease of its own from a read's
+    /// proposal time (TiKV's raftstore leader lease) must only do so when this
+    /// is `false`. Only ever `true` on a leader's local reads.
+    pub served_by_leader_lease: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -150,6 +165,9 @@ impl ReadLease {
     }
 }
 
+/// The leases a **leader** has granted to other nodes, keyed by holder. Empty on
+/// a follower: the lease a node holds itself is `ReadOnly::held_lease`, whatever
+/// its role, so nothing here is ever this node's own promise.
 #[derive(Default, Debug, Clone)]
 pub struct ReadLeaseMap {
     /// Granted leases keyed by node_id.
@@ -159,11 +177,6 @@ pub struct ReadLeaseMap {
     /// Soonest lease-expiry time, in `now_micros()` microseconds. Private cache
     /// maintained by `update_soonest_expiry`/`cleanup_expired_leases`.
     soonest_expiry: u64,
-    /// Pending (asked-for, not-yet-granted) leases: `lease_id -> start_time_micros`.
-    /// Private: only the follower ask/grant handlers in this module touch it.
-    pending_leases: HashMap<u64, u64>,
-    /// Monotonic counter feeding the low 32 bits of a minted lease id. Private.
-    pending_lease_ctr: u64,
 }
 
 impl ReadLeaseMap {
@@ -326,13 +339,10 @@ impl ReadLeaseMap {
         self.leases.len()
     }
 
-    /// Mints a fresh lease id for a follower's `MsgAskReadLease`, namespaced by
-    /// `node_id`: the low 32 bits are a per-node monotonic counter, the high 32
-    /// bits are the node id. This makes lease ids globally unique across
-    /// followers.
-    pub fn get_new_lease_id(&mut self, node_id: u64) -> u64 {
-        self.pending_lease_ctr += 1;
-        ((node_id & 0xFFFF_FFFF) << 32) | (self.pending_lease_ctr & 0xFFFF_FFFF)
+    /// Removes `node_id`'s lease, if any. Its heap entry goes stale and is
+    /// pruned lazily.
+    pub(crate) fn remove(&mut self, node_id: u64) {
+        self.leases.remove(&node_id);
     }
 }
 
@@ -373,6 +383,314 @@ pub struct ReadLeaseConfig {
     pub catchup_margin: u64,
 }
 
+/// A follower's lease request that a leader is holding until a majority returns
+/// a lease round minted after it arrived. See `ReadOnly::park_grant`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PendingGrant {
+    /// The follower-minted lease id, echoed back in the answer.
+    pub lease_id: u64,
+    /// `now_micros()` when the request arrived. Only used to tell whether a
+    /// lease dated from the request would already be over; whether the request
+    /// is covered is decided by `need_round`, never by this.
+    pub proposed_at: u64,
+    /// The follower's commit index when it asked.
+    pub asked_index: u64,
+    /// Grantable once a majority has returned this lease round or a later one.
+    pub need_round: u64,
+}
+
+/// A leader's pending renewal of its own lease.
+#[derive(Debug, Clone, Copy)]
+struct PendingSelfLease {
+    /// `now_micros()` when the renewal was proposed; the new lease starts here.
+    start: u64,
+    /// The lease round a majority must return before the renewal installs.
+    need_round: u64,
+}
+
+/// Lease-round echoes as an `AckedIndexer`, so the highest round a majority of
+/// voters has returned is computed by the same code as the commit index: joint
+/// configurations, learners (not counted) and silent voters (counted as 0) are
+/// handled identically. The leader counts as having returned its latest round.
+struct LeaseEchoIndexer<'a> {
+    echoes: &'a HashMap<u64, u64>,
+    self_id: u64,
+    round: u64,
+}
+
+impl AckedIndexer for LeaseEchoIndexer<'_> {
+    fn acked_index(&self, voter_id: u64) -> Option<Index> {
+        let round = if voter_id == self.self_id {
+            Some(self.round)
+        } else {
+            self.echoes.get(&voter_id).copied()
+        };
+        round.map(|index| Index { index, group_id: 0 })
+    }
+}
+
+/// The lease bookkeeping only a leader uses: its lease rounds, the pending
+/// renewal of its own lease, and the leases it grants to followers. Empty on a
+/// follower. The lease this node holds is `ReadOnly::held_lease`, not here.
+#[derive(Default, Debug, Clone)]
+pub struct LeaderLeaseState {
+    /// Numbers this leader's heartbeat broadcasts in a leased mode. Each one
+    /// mints the next round and carries it in `MsgHeartbeat.index`; followers
+    /// echo it in `MsgHeartbeatResponse.index`. A majority echoing round N
+    /// shows they still followed this leader when N was minted, so a proposal
+    /// recorded before N was minted may take effect. Restarts at 0 each term.
+    lease_round: u64,
+    /// When the latest round was minted. Retry pacing only.
+    lease_round_sent_at: u64,
+    /// The highest round each follower has echoed.
+    follower_echoed_rounds: HashMap<u64, u64>,
+    /// The highest round a majority has echoed. Everything waiting on it or an
+    /// earlier round has been answered.
+    lease_quorum_round: u64,
+    /// This leader's pending self-lease renewal, if any.
+    pending_self_lease: Option<PendingSelfLease>,
+    /// Whether this leader has served a read from its self-lease since that
+    /// lease installed. Tick- and timer-driven renewal only run while it is
+    /// set, so an unused self-lease lapses instead of costing a broadcast per
+    /// renewal; a read always proposes one.
+    self_lease_used: bool,
+    /// Bars this leader from renewing its own lease for the rest of the term.
+    /// See `ReadOnly::ban_self_lease`.
+    self_lease_banned: bool,
+    /// Leases this leader has granted to other nodes.
+    pub granted_leases: ReadLeaseMap,
+    /// Follower lease requests this leader is holding for a lease round, keyed
+    /// by asker.
+    pending_grants: HashMap<u64, PendingGrant>,
+    /// Nodes barred from being granted a lease for the rest of this term. See
+    /// `ban_grant`.
+    grant_banned: HashSet<u64>,
+}
+
+impl LeaderLeaseState {
+    /// Mints the next lease round. Called for every heartbeat broadcast in a
+    /// leased option, before the heartbeats are built.
+    pub(crate) fn mint_lease_round(&mut self) -> u64 {
+        self.lease_round += 1;
+        self.lease_round_sent_at = now_micros();
+        self.lease_round
+    }
+
+    /// The latest minted lease round; 0 outside leased options.
+    #[inline]
+    pub(crate) fn lease_round(&self) -> u64 {
+        self.lease_round
+    }
+
+    /// Records that `node_id` echoed `round`. Returns `false`, ignoring the
+    /// echo, if this leader never minted that round or `node_id` has already
+    /// echoed a later one.
+    pub(crate) fn record_lease_echo(&mut self, node_id: u64, round: u64) -> bool {
+        if round > self.lease_round {
+            return false;
+        }
+        let seen = self.follower_echoed_rounds.entry(node_id).or_insert(0);
+        if round <= *seen {
+            return false;
+        }
+        *seen = round;
+        true
+    }
+
+    /// Recomputes the highest round a majority of `voters` has echoed, and
+    /// returns it if it rose. Everything waiting on that round or an earlier one
+    /// is then covered.
+    pub(crate) fn advance_lease_quorum(
+        &mut self,
+        voters: &JointConfig,
+        self_id: u64,
+    ) -> Option<u64> {
+        let (q, _) = voters.committed_index(
+            false,
+            &LeaseEchoIndexer {
+                echoes: &self.follower_echoed_rounds,
+                self_id,
+                round: self.lease_round,
+            },
+        );
+        // An empty configuration reports u64::MAX; no round beyond the latest
+        // minted one can have been echoed.
+        let q = cmp::min(q, self.lease_round);
+        if q <= self.lease_quorum_round {
+            return None;
+        }
+        self.lease_quorum_round = q;
+        Some(q)
+    }
+
+    /// Whether a majority has yet to echo the latest minted round.
+    pub(crate) fn lease_round_in_flight(&self) -> bool {
+        self.lease_quorum_round < self.lease_round
+    }
+
+    /// Whether the latest round has waited long enough to be presumed lost.
+    pub(crate) fn lease_round_retry_due(&self) -> bool {
+        now_micros().saturating_sub(self.lease_round_sent_at) >= LEASE_ROUND_RETRY_MICROS
+    }
+
+    /// Whether a self-lease renewal or a follower request is waiting on a lease
+    /// round.
+    pub(crate) fn has_pending_proposals(&self) -> bool {
+        self.pending_self_lease.is_some() || !self.pending_grants.is_empty()
+    }
+
+    /// Proposes a renewal of this leader's self-lease, dated now. It installs
+    /// once a majority returns a lease round minted after this moment.
+    pub(crate) fn arm_self_lease(&mut self) {
+        self.pending_self_lease = Some(PendingSelfLease {
+            start: now_micros(),
+            need_round: self.lease_round + 1,
+        });
+    }
+
+    /// When the pending self-lease renewal was proposed, if one is pending.
+    pub(crate) fn self_lease_armed_at(&self) -> Option<u64> {
+        self.pending_self_lease.map(|p| p.start)
+    }
+
+    /// Records that this leader served a read from its self-lease.
+    pub(crate) fn mark_self_lease_used(&mut self) {
+        self.self_lease_used = true;
+    }
+
+    pub(crate) fn self_lease_used(&self) -> bool {
+        self.self_lease_used
+    }
+
+    /// Whether this leader is barred from renewing its own lease. See
+    /// `ReadOnly::ban_self_lease`.
+    pub(crate) fn is_self_lease_banned(&self) -> bool {
+        self.self_lease_banned
+    }
+
+    /// Bars `node_id` from being granted a read lease for the rest of this
+    /// term, because a configuration change removing it is in flight, and
+    /// drops any request of theirs still waiting on a lease round.
+    pub(crate) fn ban_grant(&mut self, node_id: u64) {
+        self.grant_banned.insert(node_id);
+        self.drop_pending_grant(node_id);
+    }
+
+    pub(crate) fn is_grant_banned(&self, node_id: u64) -> bool {
+        self.grant_banned.contains(&node_id)
+    }
+
+    /// Ids of followers with a held request, sorted so answers go out in a
+    /// deterministic order.
+    pub(crate) fn parked_grant_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.pending_grants.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(crate) fn parked_grant(&self, node_id: u64) -> Option<PendingGrant> {
+        self.pending_grants.get(&node_id).copied()
+    }
+
+    pub(crate) fn take_parked_grant(&mut self, node_id: u64) -> Option<PendingGrant> {
+        self.pending_grants.remove(&node_id)
+    }
+
+    /// Discards `node_id`'s held request without answering it. Used when the
+    /// follower has left the configuration.
+    pub(crate) fn drop_pending_grant(&mut self, node_id: u64) {
+        self.pending_grants.remove(&node_id);
+    }
+}
+
+/// Keeps a newly elected leader under a leased option from committing while a
+/// lease from an earlier term may still be live. See
+/// `Raft::new_leader_safeguard_passed`.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct NewLeaderSafeguard {
+    /// Whether the safeguard has lifted. Latches for the term.
+    passed: bool,
+    /// `now_micros()` when this node became leader, which is when the
+    /// safeguard starts.
+    start_micros: u64,
+    /// How long the safeguard lasts. See `start`.
+    window_micros: u64,
+    /// Peers this node has heard from at its *current* term. Such a peer has
+    /// necessarily run `reset()`, so it holds no lease from any earlier term.
+    confirmed_at_term: HashSet<u64>,
+    /// Node ids named by conf-change entries in the unapplied log tail at
+    /// election time. The shortcut waits for these as well as every node in the
+    /// current configuration: an unapplied addition is absent from `prs` but
+    /// may still hold a prior-term lease.
+    unapplied_conf_nodes: HashSet<u64>,
+    /// The election-time tail scan failed, so `unapplied_conf_nodes` may be
+    /// incomplete. Disables the shortcut entirely.
+    scan_failed: bool,
+}
+
+impl NewLeaderSafeguard {
+    /// Starts the safeguard: for the next `window_micros` this leader commits
+    /// nothing. Called from `become_leader` with one lease duration plus the
+    /// drift allowance.
+    pub(crate) fn start(&mut self, window_micros: u64) {
+        self.window_micros = window_micros;
+        self.start_micros = now_micros();
+        self.passed = window_micros == 0;
+    }
+
+    /// Whether the safeguard has lifted, latching it once its window has
+    /// elapsed. Does not consult the confirmation shortcut.
+    pub(crate) fn has_passed(&mut self) -> bool {
+        if !self.passed && now_micros().saturating_sub(self.start_micros) > self.window_micros {
+            self.passed = true;
+        }
+        self.passed
+    }
+
+    /// Latches the safeguard as passed. Used by the confirmation shortcut, so a
+    /// later configuration change cannot un-pass a window already lifted.
+    pub(crate) fn mark_passed(&mut self) {
+        self.passed = true;
+    }
+
+    /// Records that `node_id` has been heard from at this node's current term.
+    /// Ignored once the safeguard has lifted.
+    pub(crate) fn confirm_at_term(&mut self, node_id: u64) {
+        if !self.passed {
+            self.confirmed_at_term.insert(node_id);
+        }
+    }
+
+    pub(crate) fn is_confirmed_at_term(&self, node_id: u64) -> bool {
+        self.confirmed_at_term.contains(&node_id)
+    }
+
+    /// Hands over the confirmations recorded so far, so `become_leader` can
+    /// carry a candidate's vote responses across its `reset()`. The term does
+    /// not change there, so they remain proof that each voter has reset.
+    pub(crate) fn take_confirmations(&mut self) -> HashSet<u64> {
+        std::mem::take(&mut self.confirmed_at_term)
+    }
+
+    /// Records a node named by an unapplied conf change at election time.
+    pub(crate) fn add_unapplied_conf_node(&mut self, node_id: u64) {
+        self.unapplied_conf_nodes.insert(node_id);
+    }
+
+    pub(crate) fn unapplied_conf_nodes(&self) -> &HashSet<u64> {
+        &self.unapplied_conf_nodes
+    }
+
+    /// Records that the election-time tail scan failed, disabling the shortcut.
+    pub(crate) fn mark_scan_failed(&mut self) {
+        self.scan_failed = true;
+    }
+
+    pub(crate) fn scan_failed(&self) -> bool {
+        self.scan_failed
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct ReadOnly {
     pub option: ReadOnlyOption,
@@ -383,30 +701,19 @@ pub struct ReadOnly {
     pub lease_config: ReadLeaseConfig,
     /// Last time (micros) this node asked the leader for a lease.
     pub last_lease_asked: u64,
-    /// Time (micros) this `ReadOnly` was created. Observability only — the
-    /// safeguard clock is `safeguard_micros_start`, which starts later.
+    /// Time (micros) this `ReadOnly` was created. Observability only.
     pub creation_time: u64,
-    /// Whether the new-leader safeguard window has elapsed. Latches.
-    pub safeguard_passed: bool,
-    /// Phase 1 of the new-leader safeguard: leader ticks still to elapse before
-    /// the wall-clock phase may begin. See `start_new_leader_safeguard`.
-    safeguard_ticks_remaining: usize,
-    /// `now_micros()` at which phase 2 began, or 0 while phase 1 is incomplete.
-    safeguard_micros_start: u64,
-    /// Nodes barred from being granted a read lease for the rest of this term,
-    /// because a configuration change removing them is in flight.
-    lease_banned: HashSet<u64>,
-    /// Peers this node has heard from at its *current* term. Such a peer has
-    /// necessarily run `reset()`, so it holds no lease from any earlier term.
-    confirmed_at_term: HashSet<u64>,
-    /// Node ids named by conf-change entries in the unapplied log tail at
-    /// election time: an unapplied addition is absent from `prs` but may still
-    /// hold a prior-term lease, so the shortcut must hear from it too.
-    safeguard_required: HashSet<u64>,
-    /// The election-time tail scan failed, so `safeguard_required` and
-    /// `lease_banned` may be incomplete. Disables the shortcut entirely.
-    safeguard_scan_failed: bool,
-    pub lease_map: ReadLeaseMap,
+    /// The lease *this* node holds, whatever its role: a follower's is granted
+    /// by the leader, a leader's is its self-lease. Reads are served locally
+    /// only while it is live, so one gate covers both roles.
+    held_lease: Option<ReadLease>,
+    /// Lease ids this follower has asked for, mapped to when it asked. A
+    /// granted lease is dated from the ask, on this node's clock.
+    pending_leases: HashMap<u64, u64>,
+    /// Feeds the low 32 bits of minted lease ids. Seeded with a random nonce, so
+    /// ids minted after a restart within the same term do not repeat ones a
+    /// grant still in flight (or parked at the leader) could match.
+    pending_lease_ctr: u64,
     /// This node's *own* read-lease ack index: the highest log index it has
     /// promised the leader it will not serve below. Node-global and **monotone
     /// within a term**, deliberately not stored on the `ReadLease` — a lease's
@@ -414,17 +721,22 @@ pub struct ReadOnly {
     /// lease. Never persisted; `reset()` rebuilds it, and a crash discharges the
     /// promise along with the lease.
     read_lease_acked_index: u64,
+    /// Lease state only a leader uses.
+    pub leader: LeaderLeaseState,
+    /// The new-leader safeguard.
+    pub(crate) safeguard: NewLeaderSafeguard,
 }
 
 impl ReadOnly {
     /// Builds a `ReadOnly` for the given option and lease config. Pass
-    /// `ReadLeaseConfig::default()` when leases are irrelevant (non-`GrantLeases`
-    /// options, or tests); a real Raft passes `Config::read_lease_config`.
+    /// `ReadLeaseConfig::default()` when leases are irrelevant (the `Safe`
+    /// option, or tests); a real Raft passes `Config::read_lease_config`.
     pub fn new(option: ReadOnlyOption, lease_config: ReadLeaseConfig) -> ReadOnly {
         ReadOnly {
             option,
             creation_time: now_micros(),
             lease_config,
+            pending_lease_ctr: u64::from(rand::random::<u32>() >> 1),
             ..Default::default()
         }
     }
@@ -490,112 +802,75 @@ impl ReadOnly {
         self.read_index_queue.len()
     }
 
-    /// Arms the two-phase new-leader safeguard: `election_ticks` ticks
-    /// (`tick_safeguard`), then `lease_duration + SAFEGUARD_CLOCK_DRIFT_MICROS`
-    /// micros. The phases are sequential and the wait is their **sum**, not
-    /// their maximum. Called from `become_leader`.
-    pub(crate) fn start_new_leader_safeguard(&mut self, election_ticks: usize) {
-        self.safeguard_passed = false;
-        self.safeguard_ticks_remaining = election_ticks;
-        // Degenerate config: no tick phase, so phase 2 starts immediately.
-        self.safeguard_micros_start = if election_ticks == 0 { now_micros() } else { 0 };
-    }
-
-    /// Advances phase 1 by one tick, starting phase 2 when it completes.
-    /// Driven from the leader branch of `tick_heartbeat`.
-    pub(crate) fn tick_safeguard(&mut self) {
-        if self.safeguard_ticks_remaining == 0 {
-            return;
-        }
-        self.safeguard_ticks_remaining -= 1;
-        if self.safeguard_ticks_remaining == 0 {
-            self.safeguard_micros_start = now_micros();
-        }
+    /// Whether reads are served under a time-limited lease: the leader's
+    /// self-lease under both `LeaseBased` and `GrantLeases`, plus follower leases
+    /// under `GrantLeases`. A newly elected leader under these options also
+    /// waits out the new-leader safeguard, since a prior leader may still hold
+    /// a self-lease.
+    #[inline]
+    pub fn uses_read_leases(&self) -> bool {
+        matches!(
+            self.option,
+            ReadOnlyOption::LeaseBased | ReadOnlyOption::GrantLeases
+        )
     }
 
     /// Whether the new-leader safeguard window has elapsed on the *timer*, i.e.
-    /// every lease a previous leader granted has provably expired.
+    /// every lease a previous leader granted or held has provably expired.
+    /// Always true outside the leased options.
     /// `Raft::new_leader_safeguard_passed` also consults the confirmation
     /// shortcut, and is what callers should use.
     pub fn safeguard_has_passed(&mut self) -> bool {
-        if self.option != ReadOnlyOption::GrantLeases {
-            return true;
-        }
-        if self.safeguard_passed {
-            return true;
-        }
-        // Phase 1 (ticks) not finished yet.
-        if self.safeguard_micros_start == 0 {
-            return false;
-        }
-        if now_micros().saturating_sub(self.safeguard_micros_start)
-            > self.lease_config.duration_micros + SAFEGUARD_CLOCK_DRIFT_MICROS
-        {
-            self.safeguard_passed = true;
-        }
-        self.safeguard_passed
-    }
-
-    /// Latches the safeguard as passed. Used by the confirmation shortcut, so a
-    /// later configuration change cannot un-pass a window already lifted.
-    pub(crate) fn mark_safeguard_passed(&mut self) {
-        self.safeguard_passed = true;
-    }
-
-    /// Bars `node_id` from being granted a read lease for the rest of this
-    /// term, because a configuration change removing it is in flight.
-    pub(crate) fn ban_lease(&mut self, node_id: u64) {
-        self.lease_banned.insert(node_id);
-    }
-
-    pub(crate) fn is_lease_banned(&self, node_id: u64) -> bool {
-        self.lease_banned.contains(&node_id)
+        !self.uses_read_leases() || self.safeguard.has_passed()
     }
 
     /// Records that `node_id` has been heard from at this node's current term,
-    /// and so has run `reset()` and dropped any prior-term lease.
+    /// and so has run `reset()` and dropped any prior-term lease. Ignored
+    /// outside the leased options.
     pub(crate) fn confirm_at_term(&mut self, node_id: u64) {
-        if self.option == ReadOnlyOption::GrantLeases && !self.safeguard_passed {
-            self.confirmed_at_term.insert(node_id);
+        if self.uses_read_leases() {
+            self.safeguard.confirm_at_term(node_id);
         }
     }
 
-    pub(crate) fn is_confirmed_at_term(&self, node_id: u64) -> bool {
-        self.confirmed_at_term.contains(&node_id)
-    }
-
-    /// Adds a node the safeguard shortcut must hear from beyond the current
-    /// configuration (named by an unapplied conf change at election time).
-    pub(crate) fn require_confirmation(&mut self, node_id: u64) {
-        self.safeguard_required.insert(node_id);
-    }
-
-    pub(crate) fn extra_required_confirmations(&self) -> &HashSet<u64> {
-        &self.safeguard_required
-    }
-
-    /// Records that the election-time tail scan failed, disabling the shortcut.
-    pub(crate) fn mark_safeguard_scan_failed(&mut self) {
-        self.safeguard_scan_failed = true;
-    }
-
-    pub(crate) fn safeguard_scan_failed(&self) -> bool {
-        self.safeguard_scan_failed
-    }
-
-    pub fn get_read_lease(&self, node_id: u64) -> Option<&ReadLease> {
-        if self.option != ReadOnlyOption::GrantLeases {
-            return None;
+    /// Restores confirmations taken by `NewLeaderSafeguard::take_confirmations`.
+    pub(crate) fn restore_confirmations(&mut self, confirmed: HashSet<u64>) {
+        for id in confirmed {
+            self.confirm_at_term(id);
         }
-        self.lease_map.leases.get(&node_id)
     }
 
-    pub fn micros_until_lease_expired(&mut self, node_id: u64) -> u64 {
-        if self.option != ReadOnlyOption::GrantLeases {
+    /// Bans every node in `ids` from being granted a lease (see
+    /// `LeaderLeaseState::ban_grant`), and returns the first of them that
+    /// currently holds an active lease, if any.
+    pub(crate) fn ban_grants(&mut self, ids: &[u64]) -> Option<u64> {
+        let mut holder = None;
+        for &id in ids {
+            self.leader.ban_grant(id);
+            if holder.is_none() && self.has_active_granted_lease(id) {
+                holder = Some(id);
+            }
+        }
+        holder
+    }
+
+    /// Bars this leader from renewing its own lease for the rest of the term,
+    /// and drops the lease it holds and any pending renewal, so from here on
+    /// its reads take a heartbeat quorum round. Used when a configuration
+    /// change removing this leader is in flight.
+    pub(crate) fn ban_self_lease(&mut self) {
+        self.leader.self_lease_banned = true;
+        self.leader.pending_self_lease = None;
+        self.held_lease = None;
+    }
+
+    /// Micros until the lease this node holds expires, or 0 if it holds none.
+    /// Forgets the lease once it has expired.
+    pub fn micros_until_held_lease_expired(&mut self) -> u64 {
+        if !self.uses_read_leases() {
             return 0;
         }
-        // Copy the expiry out so the immutable borrow ends before the cleanup.
-        let expiry = match self.get_read_lease(node_id) {
+        let expiry = match &self.held_lease {
             Some(l) => l.start_time + l.duration,
             None => return 0,
         };
@@ -603,13 +878,44 @@ impl ReadOnly {
         if expiry > now {
             expiry - now
         } else {
-            self.lease_map.cleanup_expired_leases();
+            self.held_lease = None;
             0
         }
     }
 
-    pub fn has_active_read_lease(&mut self, node_id: u64) -> bool {
-        self.micros_until_lease_expired(node_id) > 0
+    /// Whether this node holds a live lease: a granted one on a follower, its
+    /// self-lease on a leader.
+    pub fn has_active_held_lease(&mut self) -> bool {
+        self.micros_until_held_lease_expired() > 0
+    }
+
+    /// The lease this node holds, if it is still live.
+    pub fn held_lease(&mut self) -> Option<&ReadLease> {
+        if self.micros_until_held_lease_expired() == 0 {
+            return None;
+        }
+        self.held_lease.as_ref()
+    }
+
+    /// The lease this leader granted `node_id`, if any (possibly expired).
+    pub fn granted_lease(&self, node_id: u64) -> Option<&ReadLease> {
+        if self.option != ReadOnlyOption::GrantLeases {
+            return None;
+        }
+        self.leader.granted_leases.get(node_id)
+    }
+
+    /// Whether this leader has granted `node_id` a lease that is still live.
+    pub fn has_active_granted_lease(&mut self, node_id: u64) -> bool {
+        self.option == ReadOnlyOption::GrantLeases
+            && self.leader.granted_leases.has_active_lease(node_id)
+    }
+
+    /// Whether `node_id` may take a lease under `max_leases`: a slot is free,
+    /// or it already holds one.
+    pub(crate) fn can_grant_lease_slot(&mut self, node_id: u64) -> bool {
+        self.leader.granted_leases.num_active_leases() < self.lease_config.max_leases
+            || self.leader.granted_leases.has_active_lease(node_id)
     }
 
     /// Whether the rate-limiter permits sending another `MsgAskReadLease`.
@@ -624,15 +930,15 @@ impl ReadOnly {
         self.last_lease_asked = now_micros();
     }
 
-    /// Micros until this node should next (re)ask the leader for a read lease,
-    /// for the wrapper to arm a one-shot renewal timer on the poller thread.
-    /// `0` = due now. This combines the renew-within-threshold rule
+    /// Micros until this follower should next (re)ask the leader for a read
+    /// lease, for the wrapper to arm a one-shot renewal timer on the poller
+    /// thread. `0` = due now. This combines the renew-within-threshold rule
     /// (`maybe_ask_for_read_lease` asks once the lease is within
     /// `LEASE_RENEWAL_THRESHOLD_MICROS` of expiry) with the ask rate-limit, so a
     /// just-asked-but-not-yet-granted lease re-arms at the rate-limit interval
     /// rather than spinning.
-    pub(crate) fn micros_until_lease_renewal(&mut self, node_id: u64) -> u64 {
-        let until_expired = self.micros_until_lease_expired(node_id);
+    pub(crate) fn micros_until_lease_renewal(&mut self) -> u64 {
+        let until_expired = self.micros_until_held_lease_expired();
         let until_threshold = until_expired.saturating_sub(LEASE_RENEWAL_THRESHOLD_MICROS);
         if until_threshold > 0 {
             // Lease still comfortably valid; next check is when it nears expiry.
@@ -644,26 +950,61 @@ impl ReadOnly {
         LEASE_ASK_INTERVAL_MICROS.saturating_sub(since_asked)
     }
 
+    /// Micros until this leader should next try to renew its self-lease, for
+    /// the wrapper's renewal timer. `None` when there is nothing to schedule:
+    /// not a leased option, self-banned, or a self-lease that has served no
+    /// read since it installed (a read proposes a renewal itself). While a
+    /// renewal is pending, the timer is due when that renewal goes stale and
+    /// may be proposed again; a lost lease round is otherwise retried by the
+    /// next lease event, not by the timer, so a partitioned leader costs at
+    /// most one broadcast per lease duration.
+    pub(crate) fn micros_until_self_lease_renewal(&mut self) -> Option<u64> {
+        if !self.uses_read_leases() || self.leader.self_lease_banned {
+            return None;
+        }
+        let now = now_micros();
+        if let Some(p) = self.leader.pending_self_lease {
+            let stale_at = p.start + self.lease_config.duration_micros;
+            if now < stale_at {
+                return Some(stale_at - now);
+            }
+        }
+        if !self.leader.self_lease_used {
+            return None;
+        }
+        Some(
+            self.micros_until_held_lease_expired()
+                .saturating_sub(LEASE_RENEWAL_THRESHOLD_MICROS),
+        )
+    }
+
     /// Mints a fresh lease id (namespaced by `node_id`, the caller's own id) and
     /// records its local start time in `pending_leases`.
     pub fn get_marked_lease_id(&mut self, node_id: u64) -> u64 {
-        let id = self.lease_map.get_new_lease_id(node_id);
-        self.lease_map.pending_leases.insert(id, now_micros());
+        self.pending_lease_ctr += 1;
+        let id = ((node_id & 0xFFFF_FFFF) << 32) | (self.pending_lease_ctr & 0xFFFF_FFFF);
+        self.pending_leases.insert(id, now_micros());
         id
+    }
+
+    /// Forgets a lease id this follower asked for, after the leader refused it.
+    pub(crate) fn clear_pending_lease(&mut self, lease_id: u64) {
+        self.pending_leases.remove(&lease_id);
     }
 
     /// Processes a leader-granted lease: matches it to a pending ask by id,
     /// substitutes the locally-recorded start time, subtracts the drift
-    /// safeguard, and installs it. Returns the installed lease, or `None` if
-    /// there is no matching pending ask or it has already expired.
+    /// safeguard, and installs it as this node's held lease. Returns the
+    /// installed lease, or `None` if there is no matching pending ask or it has
+    /// already expired.
     pub fn process_granted_lease(&mut self, lease: ReadLease) -> Option<ReadLease> {
         if self.option != ReadOnlyOption::GrantLeases {
             return None;
         }
         // Match the grant to a pending ask by its follower-minted id.
-        let saved_start_time = match self.lease_map.pending_leases.get(&lease.lease_id) {
+        let saved_start_time = match self.pending_leases.get(&lease.lease_id) {
             Some(t) => *t,
-            None => return None,  // This can happen due to a reset
+            None => return None, // This can happen due to a reset
         };
 
         if lease.duration == 0 || saved_start_time + lease.duration <= now_micros() {
@@ -688,27 +1029,85 @@ impl ReadOnly {
             acked_index: self.read_lease_acked_index,
             last_ack_asked: 0,
         };
-        let node_id = new_lease.node_id;
-        let installed = new_lease.clone();
-        self.lease_map.put(node_id, new_lease);
+        self.held_lease = Some(new_lease.clone());
         // One lease at a time: clear every pending ask once one is granted.
-        self.lease_map.pending_leases.clear();
-        Some(installed)
+        self.pending_leases.clear();
+        Some(new_lease)
     }
 
-    /// Records that this node has the log up to `index`, raising both its own
+    /// Installs the pending self-lease renewal if `quorum_round` covers it.
+    pub(crate) fn maybe_install_self_lease(
+        &mut self,
+        quorum_round: u64,
+        node_id: u64,
+        log_index: u64,
+    ) {
+        let p = match self.leader.pending_self_lease {
+            Some(p) if p.need_round <= quorum_round => p,
+            _ => return,
+        };
+        self.leader.pending_self_lease = None;
+        self.held_lease = Some(ReadLease {
+            lease_id: 0,
+            node_id,
+            log_index,
+            start_time: p.start,
+            duration: self.lease_config.duration_micros,
+            acked_index: 0,
+            last_ack_asked: 0,
+        });
+        self.leader.self_lease_used = false;
+    }
+
+    /// Holds a follower's lease request until a majority echoes a round minted
+    /// after it. If that follower already has a request held, the older one is
+    /// kept and this one dropped, unless the older one is stale: followers
+    /// re-ask every `LEASE_ASK_INTERVAL_MICROS`, and replacing the request each
+    /// time would keep pushing back the round it waits for. The kept request
+    /// must keep *its own* lease id: pairing a newer ask's id with the older
+    /// request's round would let the follower date its lease from an ask the
+    /// covering round does not postdate. Returns whether the request was held.
+    pub(crate) fn park_grant(&mut self, node_id: u64, lease_id: u64, asked_index: u64) -> bool {
+        if self.option != ReadOnlyOption::GrantLeases {
+            return false;
+        }
+        if let Some(old) = self.leader.pending_grants.get(&node_id) {
+            if !self.parked_grant_stale(old) {
+                return false;
+            }
+        }
+        self.leader.pending_grants.insert(
+            node_id,
+            PendingGrant {
+                lease_id,
+                proposed_at: now_micros(),
+                asked_index,
+                need_round: self.leader.lease_round + 1,
+            },
+        );
+        true
+    }
+
+    /// Whether `pg` has been held for a full lease duration, so a lease dated
+    /// from its request would already have expired.
+    pub(crate) fn parked_grant_stale(&self, pg: &PendingGrant) -> bool {
+        now_micros().saturating_sub(pg.proposed_at) >= self.lease_config.duration_micros
+    }
+
+    /// Records that this node has the log up to `index`, raising its own
     /// `read_lease_acked_index` (which makes the mark stick even with no lease
-    /// installed) and the acked index of the lease keyed by `node_id`.
+    /// installed) and the copy on its held lease.
     ///
-    /// The follower self-mark entry point, only ever called with this node's own
-    /// id. Leader-side updates to a *peer's* acked index go through
-    /// `lease_map.update_acked_index` directly.
-    pub fn mark_node_acked_index(&mut self, node_id: u64, index: u64) {
+    /// The only writer of this node's own ack promise. Leader-side updates to a
+    /// *peer's* acked index go through `granted_leases.update_acked_index`.
+    pub fn mark_self_acked_index(&mut self, index: u64) {
         if self.option != ReadOnlyOption::GrantLeases {
             return;
         }
         self.read_lease_acked_index = cmp::max(self.read_lease_acked_index, index);
-        self.lease_map.update_acked_index(node_id, index);
+        if let Some(l) = self.held_lease.as_mut() {
+            l.acked_index = cmp::max(l.acked_index, index);
+        }
     }
 
     /// This node's own read-lease ack index — the single authority for the
@@ -906,16 +1305,13 @@ mod tests {
                 catchup_margin: 10,
             },
         );
-        ro.lease_map.put(
-            node,
-            ReadLease {
-                node_id: node,
-                start_time: now_micros(),
-                duration: 60_000_000,
-                acked_index: acked,
-                ..Default::default()
-            },
-        );
+        ro.held_lease = Some(ReadLease {
+            node_id: node,
+            start_time: now_micros(),
+            duration: 60_000_000,
+            acked_index: acked,
+            ..Default::default()
+        });
         ro.read_lease_acked_index = acked;
         ro
     }
@@ -928,7 +1324,7 @@ mod tests {
         let node = 7;
         let mut ro = follower_holding_lease(node, 100);
         // Our log advanced well past what the leader has observed.
-        ro.mark_node_acked_index(node, 250);
+        ro.mark_self_acked_index(250);
         assert_eq!(ro.read_lease_acked_index(), 250);
 
         // A renewal lands carrying the leader's stale view.
@@ -949,7 +1345,7 @@ mod tests {
             "stale grant lowered the follower's ack index"
         );
         assert_eq!(
-            ro.get_read_lease(node).unwrap().acked_index,
+            ro.held_lease().unwrap().acked_index,
             250,
             "installed lease should carry the node-global ack index"
         );
@@ -962,12 +1358,11 @@ mod tests {
         let node = 7;
         let mut ro = follower_holding_lease(node, 100);
         // The lease lapses and is reaped.
-        ro.lease_map.leases.clear();
-        ro.lease_map.soonest_expiry = 0;
-        assert!(ro.get_read_lease(node).is_none());
+        ro.held_lease = None;
+        assert!(ro.held_lease().is_none());
 
         // Appends keep arriving and we keep self-marking with no lease held.
-        ro.mark_node_acked_index(node, 300);
+        ro.mark_self_acked_index(300);
         assert_eq!(
             ro.read_lease_acked_index(),
             300,
@@ -995,8 +1390,8 @@ mod tests {
     fn test_acked_index_is_monotone_within_a_term() {
         let node = 7;
         let mut ro = follower_holding_lease(node, 100);
-        ro.mark_node_acked_index(node, 400);
-        ro.mark_node_acked_index(node, 200); // out-of-order / stale mark
+        ro.mark_self_acked_index(400);
+        ro.mark_self_acked_index(200); // out-of-order / stale mark
         assert_eq!(ro.read_lease_acked_index(), 400);
 
         // A grant ahead of us does raise it.

@@ -827,32 +827,53 @@ impl<T: Storage> RawNode<T> {
         self.raft.read_only.next_read_index_delay_timeout_micros()
     }
 
-    /// Relative micros from *now* until this node should next (re)ask the leader
-    /// for a read lease, for a wrapper arming a precise one-shot renewal timer on
-    /// the poller thread. `None` when lease renewal is not applicable — the
-    /// feature is off, or this node is the leader / has no known leader (a leader
-    /// serves reads directly and holds no follower lease). `Some(0)` = due now.
+    /// Relative micros from *now* until this node should next renew the lease it
+    /// holds, for a wrapper arming a precise one-shot renewal timer on the
+    /// poller thread. `Some(0)` = due now.
     ///
-    /// Drives [`RawNode::maybe_renew_read_lease`]; renewal otherwise only fires
-    /// on an inbound heartbeat or read (`maybe_ask_for_read_lease`).
+    /// - **Follower** (`GrantLeases`, asking for leases, leader known): when to
+    ///   (re)ask the leader for a lease.
+    /// - **Leader** (either leased option): when to propose renewing its own
+    ///   self-lease. `None` unless that lease has served a read since it
+    ///   installed (a read proposes a renewal itself), or while this leader is
+    ///   proposing its own removal. While a renewal is pending, due when it goes
+    ///   stale and may be proposed again.
+    ///
+    /// `None` otherwise. Drives [`RawNode::maybe_renew_read_lease`]; renewal
+    /// otherwise only happens on an inbound heartbeat or read, or a tick.
     pub fn micros_until_lease_renewal_timeout_micros(&mut self) -> Option<u64> {
-        if !self.is_asking_for_read_lease()
-            || self.raft.state == StateRole::Leader
-            || self.raft.leader_id == crate::INVALID_ID
-        {
+        if self.raft.state == StateRole::Leader {
+            return self.raft.read_only.micros_until_self_lease_renewal();
+        }
+        if !self.is_asking_for_read_lease() || self.raft.leader_id == crate::INVALID_ID {
             return None;
         }
-        let self_id = self.raft.id;
-        Some(self.raft.read_only.micros_until_lease_renewal(self_id))
+        Some(self.raft.read_only.micros_until_lease_renewal())
     }
 
-    /// Ask the leader for a (renewed) read lease if the lease is near expiry (or
-    /// absent) and the rate-limiter permits. Returns `true` if a message was
-    /// produced (a `Ready` is worth collecting). The timer-driven analogue of the
-    /// heartbeat-triggered renewal, to be called on the same thread that drives
-    /// the rest of the `RawNode`.
+    /// Renews the lease this node holds if it is due. On a follower: asks the
+    /// leader for a (renewed) lease if it is near expiry (or absent) and the
+    /// rate-limiter permits. On a leader: proposes renewing its self-lease and
+    /// sends a lease round for it. Returns `true` if a message was produced (a
+    /// `Ready` is worth collecting). The timer-driven analogue of the
+    /// heartbeat- and read-triggered renewal, to be called on the same thread
+    /// that drives the rest of the `RawNode`.
     pub fn maybe_renew_read_lease(&mut self) -> bool {
+        if self.raft.state == StateRole::Leader {
+            return self.raft.maybe_renew_self_lease_proactively();
+        }
         self.raft.maybe_ask_for_read_lease()
+    }
+
+    /// Like [`RawNode::read_index`], but on a leader under a leased option the
+    /// index is confirmed by a heartbeat quorum round instead of being served
+    /// from the leader's self-lease. For a caller that treats the answer as
+    /// evidence that a majority followed this leader when the read was proposed
+    /// (TiKV renews its raftstore leader lease from it). Only a leader can
+    /// honour this; elsewhere it is an ordinary `read_index`, and the
+    /// `ReadState` records how the index was actually obtained.
+    pub fn read_index_quorum(&mut self, rctx: Vec<u8>) {
+        self.raft.read_index_quorum(rctx);
     }
 
     /// Relative micros until the soonest read lease this leader has granted is
@@ -870,7 +891,11 @@ impl<T: Storage> RawNode<T> {
         {
             return None;
         }
-        self.raft.read_only.lease_map.micros_until_soonest_expiry()
+        self.raft
+            .read_only
+            .leader
+            .granted_leases
+            .micros_until_soonest_expiry()
     }
 
     /// Reaps expired read leases (dropping them from the min-acked commit clamp)
@@ -884,7 +909,11 @@ impl<T: Storage> RawNode<T> {
         {
             return false;
         }
-        self.raft.read_only.lease_map.cleanup_expired_leases();
+        self.raft
+            .read_only
+            .leader
+            .granted_leases
+            .cleanup_expired_leases();
         if self.raft.maybe_commit() {
             self.raft.bcast_append();
             true

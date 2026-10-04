@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::read_only::SAFEGUARD_CLOCK_DRIFT_MICROS;
 pub use super::read_only::{ReadLeaseConfig, ReadOnlyOption};
 use super::util::NO_LIMIT;
 use super::{
@@ -81,8 +82,12 @@ pub struct Config {
     /// Setting this to `LeaseBased` requires `check_quorum = true`.
     pub read_only_option: ReadOnlyOption,
 
-    /// Duration in microseconds that a follower read lease is valid for when
-    /// `read_only_option == GrantLeases`.
+    /// Duration in microseconds a read lease is valid for, under either leased
+    /// option: a follower's granted lease (`GrantLeases`) and the leader's own
+    /// self-lease (`LeaseBased` and `GrantLeases`). Also the length of the
+    /// new-leader safeguard. Must exceed the 1 ms clock-drift allowance; a lease
+    /// that short would be born expired and reads would quietly fall back to
+    /// quorum rounds.
     pub read_lease_duration_micros: u64,
 
     /// Maximum number of outstanding read leases a leader will grant at once
@@ -243,6 +248,19 @@ impl Config {
             return Err(Error::ConfigInvalid(
                 "read_only_option == GrantLeases requires check_quorum == true".into(),
             ));
+        }
+
+        // Both leased options serve the leader's reads from a self-lease, so
+        // both need a lease that outlives the drift allowance.
+        if matches!(
+            self.read_only_option,
+            ReadOnlyOption::LeaseBased | ReadOnlyOption::GrantLeases
+        ) && self.read_lease_duration_micros <= SAFEGUARD_CLOCK_DRIFT_MICROS
+        {
+            return Err(Error::ConfigInvalid(format!(
+                "read_only_option == {:?} requires read_lease_duration_micros > {}",
+                self.read_only_option, SAFEGUARD_CLOCK_DRIFT_MICROS
+            )));
         }
 
         if self.ask_for_read_lease && self.read_only_option != ReadOnlyOption::GrantLeases {
