@@ -773,20 +773,27 @@ impl<T: Storage> RawNode<T> {
     }
 
     /// Like `read_index`, but carries an extra index requirement in the `commit`
-    /// field of the `MsgReadIndex`.
+    /// field of the `MsgReadIndex`, and the term it belongs to in `log_term`.
     ///
     /// `required_index` is an index this node must have committed before a lease
     /// holder may serve this read locally; `0` — the only reserved value —
     /// means no extra requirement. A caller that must not have the read served
     /// locally at all passes an index this node cannot reach (`u64::MAX`), which
     /// the follower gate's ordinary rules forward to the leader.
-    pub fn read_index_switch_hint(&mut self, rctx: Vec<u8>, required_index: u64) {
+    ///
+    /// `hint_term` is the term `required_index` was stamped in. A nonzero
+    /// `required_index` is used only while `hint_term` equals this node's term
+    /// modulo 2^32 (the width the switch carries); otherwise it is treated as
+    /// `u64::MAX`, so the read is forwarded, never held (SAFE-1). Ignored when
+    /// `required_index` is 0.
+    pub fn read_index_switch_hint(&mut self, rctx: Vec<u8>, required_index: u64, hint_term: u64) {
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgReadIndex);
         let mut e = Entry::default();
         e.data = rctx.into();
         m.set_entries(vec![e].into());
         m.commit = required_index;
+        m.log_term = hint_term;
         let _ = self.raft.step(m);
     }
 

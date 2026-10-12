@@ -1232,22 +1232,18 @@ impl<T: Storage> Raft<T> {
             // heuristic, the grant carries this leader's commit index, and the
             // follower cannot serve below it anyway. Re-checking it would
             // refuse leases whenever writes are flowing.
-            let pr_match = match self.prs().get(id) {
-                Some(pr) => pr.matched,
-                None => {
-                    self.send_read_lease_resp(id, pg.lease_id, None);
-                    continue;
-                }
-            };
-            if !self.read_only.can_grant_lease_slot(id) {
+            if self.prs().get(id).is_none() || !self.read_only.can_grant_lease_slot(id) {
                 self.send_read_lease_resp(id, pg.lease_id, None);
                 continue;
             }
+            let acked = self
+                .read_only
+                .grant_acked_index(id, pg.lease_id, pg.asked_index);
             let duration = self.read_only.lease_config.duration_micros;
             let lease = self.read_only.leader.granted_leases.grant_new_lease(
                 id,
                 pg.lease_id,
-                cmp::max(pg.asked_index, pr_match),
+                acked,
                 committed,
                 duration,
             );
@@ -1383,6 +1379,18 @@ impl<T: Storage> Raft<T> {
             Some(rl) => rl.acked_index,
             None => return,
         };
+        // Term 0 is a switch credit injected by the application, which vouches
+        // for the holder's reads whatever its incarnation. A holder's own
+        // answer counts only from the incarnation that asked for this grant.
+        if m.term != 0 && !self.read_only.ack_matches_grant(m.from, m.log_term) {
+            info!(
+                self.logger,
+                "ignoring MsgAskAckIndexResp from {from}: incarnation {incarnation} did not ask for its grant",
+                from = m.from,
+                incarnation = m.log_term;
+            );
+            return;
+        }
         let min_before = self.read_only.leader.granted_leases.min_acked_index();
         self.read_only
             .leader
@@ -1413,7 +1421,7 @@ impl<T: Storage> Raft<T> {
         if until_expired >= LEASE_RENEWAL_THRESHOLD_MICROS || !self.read_only.can_ask_for_lease() {
             return false;
         }
-        let lease_id = self.read_only.get_marked_lease_id(self_id);
+        let lease_id = self.read_only.get_marked_lease_id();
         let committed = self.raft_log.committed;
         let leader = self.leader_id;
         let mut m = Message::default();
@@ -1438,7 +1446,17 @@ impl<T: Storage> Raft<T> {
     /// locally from our lease when commit has caught up, hold it in the delayer
     /// when commit is close enough to catch up shortly, or forward it to the
     /// leader otherwise.
-    fn serve_read_index_with_lease(&mut self, m: Message) {
+    fn serve_read_index_with_lease(&mut self, mut m: Message) {
+        // A hint covers this term's credits only if this term's leader wrote
+        // the switch register it came from: after a switch reboot, a deposed
+        // leader's lower write can land first (SAFE-1). The switch carries the
+        // term in 32 bits. Any other nonzero hint is made unreachable, so it is
+        // forwarded and never held. A held read cannot outlive a term change:
+        // `reset` rebuilds `read_only`, delayer included.
+        if m.commit != 0 && m.log_term as u32 != self.term as u32 {
+            m.commit = u64::MAX;
+        }
+
         let committed = self.raft_log.committed;
 
         // No usable lease, so forward to the leader.
@@ -1455,9 +1473,10 @@ impl<T: Storage> Raft<T> {
 
         // `m.commit` is an extra index this node must have committed before it
         // may serve the read from its own lease; 0 is the sole reserved value
-        // and means no extra requirement. An unreachable index needs no case of
-        // its own: it fails the serve test and exceeds the hold threshold, so
-        // the read forwards. See `RawNode::read_index_switch_hint`.
+        // and means no extra requirement. An unreachable index (including a
+        // hint from another term, rewritten above) needs no case of its own:
+        // it fails the serve test and exceeds the hold threshold, so the read
+        // forwards. See `RawNode::read_index_switch_hint`.
         let hint = m.commit;
         // m.index != 0 is the delayed-read replay hook.
         let can_serve = (acked_index <= committed && (hint == 0 || hint <= committed))
@@ -2567,8 +2586,12 @@ impl<T: Storage> Raft<T> {
         }
 
         // GrantLeases: the append response is a fresher acked index for this
-        // holder than the commit clamp currently has.
-        if self.read_only.option == ReadOnlyOption::GrantLeases {
+        // holder than the commit clamp currently has. `matched` advances from
+        // any ack; the grant only from the incarnation that asked for it
+        // (`log_term`, see `mark_append_ack`).
+        if self.read_only.option == ReadOnlyOption::GrantLeases
+            && self.read_only.ack_matches_grant(m.from, m.log_term)
+        {
             self.read_only
                 .leader
                 .granted_leases
@@ -3275,6 +3298,9 @@ impl<T: Storage> Raft<T> {
                     // leader answered it is its own business.
                     served_by_follower_lease: false,
                     served_by_leader_lease: false,
+                    // `step` drops a lower-term response and adopts a higher
+                    // term, so this is the answering leader's term.
+                    term: self.term,
                 };
                 self.read_states.push(rs);
                 // `index` and `term` in MsgReadIndexResp is the leader's commit index and its current term,
@@ -3360,6 +3386,7 @@ impl<T: Storage> Raft<T> {
                 resp.to = m.from;
                 resp.from = self_id;
                 resp.index = 0;
+                resp.log_term = self.read_only.incarnation_id();
                 if self.read_only.has_active_held_lease() {
                     // Mark before reporting: the mark is the promise, so no
                     // later grant can install an ack index below what the leader
@@ -3423,6 +3450,21 @@ impl<T: Storage> Raft<T> {
         Err(Error::RequestSnapshotDropped)
     }
 
+    /// GrantLeases: records `index` as this node's acked index (its read-lease
+    /// promise) and stamps `resp`, a successful `MsgAppendResponse` acking
+    /// `index`, with the incarnation holding that promise in `log_term`, which
+    /// a successful response otherwise leaves unused. The leader credits the
+    /// ack to a grant only from that incarnation (`ack_matches_grant`).
+    /// Rejections keep `log_term` as the hint term. A no-op in other options,
+    /// so their responses are unchanged.
+    fn mark_append_ack(&mut self, resp: &mut Message, index: u64) {
+        if self.read_only.option != ReadOnlyOption::GrantLeases {
+            return;
+        }
+        self.read_only.mark_self_acked_index(index);
+        resp.log_term = self.read_only.incarnation_id();
+    }
+
     // TODO: revoke pub when there is a better way to test.
     /// For a given message, append the entries to the log.
     pub fn handle_append_entries(&mut self, m: &Message) {
@@ -3440,11 +3482,9 @@ impl<T: Storage> Raft<T> {
             to_send.to = m.from;
             to_send.index = self.raft_log.committed;
             to_send.commit = self.raft_log.committed;
-            // GrantLeases: record our (already-committed) index as this node's acked index.
-            if self.read_only.option == ReadOnlyOption::GrantLeases {
-                let committed = self.raft_log.committed;
-                self.read_only.mark_self_acked_index(committed);
-            }
+            // Our (already-committed) index is this node's acked index.
+            let committed = self.raft_log.committed;
+            self.mark_append_ack(&mut to_send, committed);
             self.r.send(to_send, &mut self.msgs);
             return;
         }
@@ -3458,10 +3498,8 @@ impl<T: Storage> Raft<T> {
             .maybe_append(m.index, m.log_term, m.commit, &m.entries)
         {
             to_send.set_index(last_idx);
-            // GrantLeases: our log advanced; record it as this node's acked index.
-            if self.read_only.option == ReadOnlyOption::GrantLeases {
-                self.read_only.mark_self_acked_index(last_idx);
-            }
+            // Our log advanced; record it as this node's acked index.
+            self.mark_append_ack(&mut to_send, last_idx);
         } else {
             debug!(
                 self.logger,
@@ -3536,11 +3574,9 @@ impl<T: Storage> Raft<T> {
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.to = m.from;
             to_send.index = self.raft_log.last_index();
-            // GrantLeases: the snapshot advanced our commit; record it as this node's acked index.
-            if self.read_only.option == ReadOnlyOption::GrantLeases {
-                let last_index = self.raft_log.last_index();
-                self.read_only.mark_self_acked_index(last_index);
-            }
+            // The snapshot advanced our commit; record it as this node's acked index.
+            let last_index = self.raft_log.last_index();
+            self.mark_append_ack(&mut to_send, last_index);
             self.r.send(to_send, &mut self.msgs);
         } else {
             info!(
@@ -3554,11 +3590,9 @@ impl<T: Storage> Raft<T> {
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.to = m.from;
             to_send.index = self.raft_log.committed;
-            // GrantLeases: record our (unchanged) commit as this node's acked index.
-            if self.read_only.option == ReadOnlyOption::GrantLeases {
-                let committed = self.raft_log.committed;
-                self.read_only.mark_self_acked_index(committed);
-            }
+            // Record our (unchanged) commit as this node's acked index.
+            let committed = self.raft_log.committed;
+            self.mark_append_ack(&mut to_send, committed);
             self.r.send(to_send, &mut self.msgs);
         }
     }
@@ -3896,6 +3930,7 @@ impl<T: Storage> Raft<T> {
                 request_ctx: req.take_entries()[0].take_data().to_vec(),
                 served_by_follower_lease: provenance == ReadProvenance::FollowerLease,
                 served_by_leader_lease: provenance == ReadProvenance::LeaderLease,
+                term: self.term,
             };
             self.read_states.push(rs);
             return None;

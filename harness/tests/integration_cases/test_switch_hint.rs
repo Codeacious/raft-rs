@@ -1,15 +1,17 @@
 // Copyright 2026 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! Coverage for the extra index requirement a `MsgReadIndex` can carry in its
-//! `commit` field (`RawNode::read_index_switch_hint`) and the follower serve
-//! gate's handling of it. Rust twin of the Go fork's
+//! `commit` field, with its term in `log_term` (`RawNode::read_index_switch_hint`),
+//! and the follower serve gate's handling of it. Rust twin of the Go fork's
 //! `read_only_switch_hint_test.go`.
 //!
 //! The contract is deliberately index-shaped and knows nothing about switches:
 //! `commit` is an extra index this node must have committed before it may serve
 //! the read from its own lease, and 0 is the only reserved value, meaning "no
 //! extra requirement". A caller that must not be served locally at all says so
-//! in the same vocabulary, by naming an index this node cannot reach.
+//! in the same vocabulary, by naming an index this node cannot reach. A nonzero
+//! `commit` counts only in the term (mod 2^32) given in `log_term`; in any other
+//! term it is treated as unreachable (SAFE-1).
 //!
 //! These live in the harness rather than in `read_only.rs` because the decision
 //! is made in `Raft::serve_read_index_with_lease`, which needs a whole node
@@ -31,7 +33,12 @@ const LEASE_DURATION_MICROS: u64 = 500_000;
 /// `COMMITTED`, holding a live read lease granted at log index 5 and having
 /// acked up to `acked_index`.
 fn switch_hint_node(acked_index: u64, l: &slog::Logger) -> RawNode<MemStorage> {
-    let mut node = leaseless_follower(l);
+    switch_hint_node_at(acked_index, 1, l)
+}
+
+/// `switch_hint_node`, at `term`.
+fn switch_hint_node_at(acked_index: u64, term: u64, l: &slog::Logger) -> RawNode<MemStorage> {
+    let mut node = leaseless_follower_at(term, l);
     install_lease(&mut node, acked_index);
     node
 }
@@ -39,6 +46,11 @@ fn switch_hint_node(acked_index: u64, l: &slog::Logger) -> RawNode<MemStorage> {
 /// The same follower, before any lease is granted. `ReadLeaseMap::leases` is
 /// `pub(crate)`, so the no-lease case has to be built rather than torn down.
 fn leaseless_follower(l: &slog::Logger) -> RawNode<MemStorage> {
+    leaseless_follower_at(1, l)
+}
+
+/// `leaseless_follower`, at `term`.
+fn leaseless_follower_at(term: u64, l: &slog::Logger) -> RawNode<MemStorage> {
     let storage = new_storage();
     storage.initialize_with_conf_state((vec![1, 2, 3], vec![]));
     let ents: Vec<Entry> = (1..=COMMITTED)
@@ -61,7 +73,7 @@ fn leaseless_follower(l: &slog::Logger) -> RawNode<MemStorage> {
         ..new_test_config(1, 10, 1)
     };
     let mut node = RawNode::new(&cfg, storage, l).expect("build RawNode");
-    node.raft.become_follower(1, 2);
+    node.raft.become_follower(term, 2);
     node.raft.raft_log.commit_to(COMMITTED);
     node
 }
@@ -72,7 +84,7 @@ fn leaseless_follower(l: &slog::Logger) -> RawNode<MemStorage> {
 /// 48-byte lease. The granted `acked_index` is maxed into this node's own
 /// `read_lease_acked_index`, which is the value the serve gate consults.
 fn install_lease(node: &mut RawNode<MemStorage>, acked_index: u64) {
-    let lease_id = node.raft.read_only.get_marked_lease_id(1);
+    let lease_id = node.raft.read_only.get_marked_lease_id();
     let mut resp = new_message(2, 1, MessageType::MsgAskReadLeaseResp, 0);
     let mut e = Entry::default();
     e.data = marshal_lease(lease_id, 1, 5, LEASE_DURATION_MICROS, acked_index).into();
@@ -104,9 +116,16 @@ fn marshal_lease(
         .collect()
 }
 
+/// Steps a read hinted in this node's own term.
 fn step_hinted_read(node: &mut RawNode<MemStorage>, hint: u64) {
+    let term = node.raft.term;
+    step_hinted_read_at_term(node, hint, term);
+}
+
+fn step_hinted_read_at_term(node: &mut RawNode<MemStorage>, hint: u64, hint_term: u64) {
     let mut m = new_message(2, 1, MessageType::MsgReadIndex, 0);
     m.commit = hint;
+    m.log_term = hint_term;
     let mut e = Entry::default();
     e.data = b"ctx".to_vec().into();
     m.set_entries(vec![e].into());
@@ -132,7 +151,12 @@ fn outcome(node: &mut RawNode<MemStorage>) -> Outcome {
         {
             Outcome::Forwarded
         }
-        _ => panic!("unexpected outcome: {} msgs ({:?}), held={}", msgs.len(), msgs, held),
+        _ => panic!(
+            "unexpected outcome: {} msgs ({:?}), held={}",
+            msgs.len(),
+            msgs,
+            held
+        ),
     }
 }
 
@@ -181,6 +205,85 @@ fn test_switch_hint_gate() {
     }
 }
 
+/// A hint counts only in the term whose leader wrote the switch register it
+/// came from (SAFE-1). A hint from any other term is treated exactly like
+/// `u64::MAX`: forwarded, even one that would otherwise be served, and never
+/// held, even within the hold gap. The term is compared modulo 2^32, the width
+/// the switch carries. Twin of Go's `TestSwitchHintTermGate`.
+#[test]
+fn test_switch_hint_term_gate() {
+    const WRAP: u64 = 1 << 32;
+    let l = default_logger();
+    // Go's term 1 (so "earlier" is 0), a later one, and one past 2^32, where
+    // the switch's stamp is only the low half.
+    for term in [1u64, 7, WRAP + 7] {
+        // (name, hint, hint_term, acked_index, expected)
+        let cases: &[(&str, u64, u64, u64, Outcome)] = &[
+            ("hint at this term", 5, term, 5, Outcome::Served),
+            (
+                "hint at this term mod 2^32",
+                5,
+                term + WRAP,
+                5,
+                Outcome::Served,
+            ),
+            (
+                "hint at this term's low 32 bits",
+                5,
+                term as u32 as u64,
+                5,
+                Outcome::Served,
+            ),
+            (
+                "hint from an earlier term",
+                5,
+                term - 1,
+                5,
+                Outcome::Forwarded,
+            ),
+            ("hint from a later term", 5, term + 1, 5, Outcome::Forwarded),
+            ("no hint ignores the term", 0, term + 1, 5, Outcome::Served),
+            // Never held: neither for its own gap nor for the acked index's.
+            (
+                "hint in the hold gap at this term",
+                20,
+                term,
+                5,
+                Outcome::Held,
+            ),
+            (
+                "hint in the hold gap from a later term",
+                20,
+                term + 1,
+                5,
+                Outcome::Forwarded,
+            ),
+            (
+                "acked ahead, hint from an earlier term",
+                5,
+                term - 1,
+                20,
+                Outcome::Forwarded,
+            ),
+            ("acked ahead, no hint", 0, term + 1, 20, Outcome::Held),
+        ];
+        for (name, hint, hint_term, acked_index, want) in cases {
+            let mut node = switch_hint_node_at(*acked_index, term, &l);
+            step_hinted_read_at_term(&mut node, *hint, *hint_term);
+            assert_eq!(&outcome(&mut node), want, "term {}: case {}", term, name);
+        }
+    }
+
+    // Forwarded as unreachable, like Go: a node with a stale leader id that
+    // receives it cannot use the hint in its own term either.
+    let mut node = switch_hint_node_at(5, 7, &l);
+    step_hinted_read_at_term(&mut node, 5, 6);
+    let msgs: Vec<Message> = node.raft.msgs.drain(..).collect();
+    assert_eq!(msgs.len(), 1, "expected one forward, got {:?}", msgs);
+    assert_eq!(msgs[0].get_msg_type(), MessageType::MsgReadIndex);
+    assert_eq!(msgs[0].commit, u64::MAX);
+}
+
 /// Pins the hole an unreachable hint closes, and the reason it may not be held.
 /// Holding it would be worse than useless: the delayer waits for this node's
 /// commit index to reach `max(hint, acked_index)`, which no commit can satisfy,
@@ -211,7 +314,13 @@ fn test_switch_hint_unreachable_is_not_held() {
         );
 
         let msgs: Vec<Message> = node.raft.msgs.drain(..).collect();
-        assert_eq!(msgs.len(), 1, "acked {}: expected one message, got {:?}", acked_index, msgs);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "acked {}: expected one message, got {:?}",
+            acked_index,
+            msgs
+        );
         assert_eq!(msgs[0].get_msg_type(), MessageType::MsgReadIndex);
         assert_eq!(msgs[0].to, 2);
         // The hint rides along to the leader untouched. That is fine, and is why
@@ -241,7 +350,11 @@ fn test_switch_hint_unreachable_without_lease() {
         .iter()
         .filter(|m| m.get_msg_type() == MessageType::MsgReadIndex && m.to == 2)
         .count();
-    assert_eq!(forwarded, 1, "expected one forward to the leader, got {:?}", msgs);
+    assert_eq!(
+        forwarded, 1,
+        "expected one forward to the leader, got {:?}",
+        msgs
+    );
     assert!(
         node.next_read_index_delay_micros().is_none(),
         "unreachable hint was held by the delayer"
@@ -266,6 +379,7 @@ fn test_read_state_records_whether_the_lease_served_it() {
     let mut node = switch_hint_node(5, &l);
     let mut m = new_message(0, 1, MessageType::MsgReadIndex, 0);
     m.commit = 5;
+    m.log_term = node.raft.term;
     let mut e = Entry::default();
     e.data = b"local".to_vec().into();
     m.set_entries(vec![e].into());
@@ -300,4 +414,61 @@ fn test_read_state_records_whether_the_lease_served_it() {
         !node.raft.read_states[0].served_by_follower_lease,
         "a leader-answered index must not be marked lease-served"
     );
+}
+
+/// Steps a locally issued read (`from` unset, as
+/// `RawNode::read_index_switch_hint` makes one).
+fn step_local_read(node: &mut RawNode<MemStorage>, ctx: &[u8], hint: u64, hint_term: u64) {
+    let mut m = new_message(0, 1, MessageType::MsgReadIndex, 0);
+    m.commit = hint;
+    m.log_term = hint_term;
+    let mut e = Entry::default();
+    e.data = ctx.to_vec().into();
+    m.set_entries(vec![e].into());
+    node.step(m).expect("step local MsgReadIndex");
+}
+
+/// `ReadState::term` is the term a follower read's index was produced in, on
+/// both paths: served from this node's lease, and answered by the leader. TiKV
+/// applies a read's switch stamp as a floor only if the stamp's term equals it
+/// (SAFE-1).
+#[test]
+fn test_read_state_records_its_term() {
+    const TERM: u64 = 3;
+    let l = default_logger();
+
+    // Served from the lease.
+    let mut node = switch_hint_node_at(5, TERM, &l);
+    step_local_read(&mut node, b"local", 5, TERM);
+    assert_eq!(node.raft.read_states.len(), 1, "read should be served here");
+    assert!(node.raft.read_states[0].served_by_follower_lease);
+    assert_eq!(node.raft.read_states[0].term, TERM);
+
+    // A later term's lease serves in that term.
+    node.raft.read_states.clear();
+    node.raft.become_follower(TERM + 1, 2);
+    install_lease(&mut node, 5);
+    step_local_read(&mut node, b"next", 5, TERM + 1);
+    assert_eq!(node.raft.read_states.len(), 1, "read should be served here");
+    assert!(node.raft.read_states[0].served_by_follower_lease);
+    assert_eq!(node.raft.read_states[0].term, TERM + 1);
+
+    // Forwarded (a hint from the previous term), then answered by the
+    // leader's MsgReadIndexResp at its term.
+    let mut node = switch_hint_node_at(5, TERM, &l);
+    step_local_read(&mut node, b"forwarded", 5, TERM - 1);
+    assert!(
+        node.raft.read_states.is_empty(),
+        "a hint from another term must not be served locally"
+    );
+    let mut resp = new_message(2, 1, MessageType::MsgReadIndexResp, 0);
+    resp.term = TERM;
+    resp.index = COMMITTED;
+    let mut e = Entry::default();
+    e.data = b"forwarded".to_vec().into();
+    resp.set_entries(vec![e].into());
+    node.step(resp).expect("step MsgReadIndexResp");
+    assert_eq!(node.raft.read_states.len(), 1);
+    assert!(!node.raft.read_states[0].served_by_follower_lease);
+    assert_eq!(node.raft.read_states[0].term, TERM);
 }

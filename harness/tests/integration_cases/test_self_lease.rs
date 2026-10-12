@@ -233,6 +233,7 @@ fn test_self_lease_requires_fresh_quorum() {
     echo(&mut raft, 2, r1, &ctx);
     assert_eq!(raft.read_states.len(), 1);
     assert!(!raft.read_states[0].served_by_leader_lease);
+    assert_eq!(raft.read_states[0].term, raft.term);
     assert!(raft.read_only.has_active_held_lease());
     raft.read_states.clear();
     raft.read_messages();
@@ -247,6 +248,7 @@ fn test_self_lease_requires_fresh_quorum() {
     assert_eq!(raft.read_states.len(), 1);
     assert!(raft.read_states[0].served_by_leader_lease);
     assert!(!raft.read_states[0].served_by_follower_lease);
+    assert_eq!(raft.read_states[0].term, raft.term);
 }
 
 /// `RawNode::read_index_quorum` ignores a live self-lease and takes a quorum
@@ -439,7 +441,7 @@ fn test_rejected_ask_clears_pending_lease() {
         .find(|m| m.get_msg_type() == MessageType::MsgAskReadLease);
     let lease_id = match asked {
         Some(m) => m.log_term,
-        None => f.read_only.get_marked_lease_id(2),
+        None => f.read_only.get_marked_lease_id(),
     };
     let mut reject = new_message(1, 2, MessageType::MsgAskReadLeaseResp, 0);
     reject.term = 1;

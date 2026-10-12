@@ -20,6 +20,7 @@ use std::collections::{BinaryHeap, VecDeque};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use rand::Rng;
 use slog::Logger;
 
 use crate::eraftpb::Message;
@@ -55,6 +56,12 @@ pub(crate) const READ_INDEX_LOCAL_HOLD_DURATION_MICROS: u64 = 5_000; // 5ms
 pub(crate) fn now_micros() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// The incarnation a lease id was minted under: its upper 32 bits (see
+/// `ReadOnly::incarnation_id`).
+pub(crate) fn lease_incarnation(lease_id: u64) -> u64 {
+    lease_id >> 32
 }
 
 /// Determines the relative safety of and consistency of read only requests.
@@ -102,6 +109,13 @@ pub struct ReadState {
     /// proposal time (TiKV's raftstore leader lease) must only do so when this
     /// is `false`. Only ever `true` on a leader's local reads.
     pub served_by_leader_lease: bool,
+    /// The raft term this node was in when it produced this state: when it
+    /// served the read from its own lease, when a quorum round confirmed it, or
+    /// when the leader's `MsgReadIndexResp` arrived (then the leader's term).
+    /// A wrapper that applies a per-read floor stamped in some term (TiKV's
+    /// assist gate, SAFE-1) may use the floor only if that term equals this one
+    /// modulo 2^32.
+    pub term: u64,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -117,7 +131,8 @@ pub struct ReadIndexStatus {
 /// `last_ack_asked` is an in-memory-only field and is never marshalled.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct ReadLease {
-    /// Follower-minted lease id (high 32 bits = the holder's node id).
+    /// Follower-minted lease id (high 32 bits = the minting `ReadOnly`'s
+    /// incarnation).
     pub lease_id: u64,
     /// The node holding the lease.
     pub node_id: u64,
@@ -710,16 +725,19 @@ pub struct ReadOnly {
     /// Lease ids this follower has asked for, mapped to when it asked. A
     /// granted lease is dated from the ask, on this node's clock.
     pending_leases: HashMap<u64, u64>,
-    /// Feeds the low 32 bits of minted lease ids. Seeded with a random nonce, so
-    /// ids minted after a restart within the same term do not repeat ones a
-    /// grant still in flight (or parked at the leader) could match.
-    pending_lease_ctr: u64,
+    /// The low 32 bits of minted lease ids. Wraps within them, so every id keeps
+    /// this instance's incarnation.
+    pending_lease_ctr: u32,
+    /// The upper 32 bits of every lease id this instance mints: random in
+    /// [1, 2^31), as in the Go fork, so never 0; see `incarnation_id`.
+    incarnation: u64,
     /// This node's *own* read-lease ack index: the highest log index it has
     /// promised the leader it will not serve below. Node-global and **monotone
-    /// within a term**, deliberately not stored on the `ReadLease` — a lease's
-    /// copy is only as fresh as the grant that installed it and dies with the
-    /// lease. Never persisted; `reset()` rebuilds it, and a crash discharges the
-    /// promise along with the lease.
+    /// per `ReadOnly` instance**, deliberately not stored on the `ReadLease` — a
+    /// lease's copy is only as fresh as the grant that installed it and dies
+    /// with the lease. Never persisted; every `reset()` (same-term ones too)
+    /// rebuilds it at 0, and a crash discharges it, so it is only as good as
+    /// the incarnation holding it.
     read_lease_acked_index: u64,
     /// Lease state only a leader uses.
     pub leader: LeaderLeaseState,
@@ -736,9 +754,19 @@ impl ReadOnly {
             option,
             creation_time: now_micros(),
             lease_config,
-            pending_lease_ctr: u64::from(rand::random::<u32>() >> 1),
+            incarnation: rand::thread_rng().gen_range(1..=u64::from(u32::MAX >> 1)),
             ..Default::default()
         }
+    }
+
+    /// Identifies this instance, and with it the lifetime of its promise
+    /// (`read_lease_acked_index`). Every `reset()` builds a new instance with a
+    /// zero promise and a fresh random incarnation, so an ack is only as good
+    /// as the incarnation that sent it. A holder carries it in `log_term` on
+    /// its acks, and the leader credits an ack to a grant only if the same
+    /// incarnation asked for that grant (`ack_matches_grant`).
+    pub fn incarnation_id(&self) -> u64 {
+        self.incarnation
     }
 
     /// Adds a read only request into readonly struct.
@@ -905,6 +933,34 @@ impl ReadOnly {
         self.leader.granted_leases.get(node_id)
     }
 
+    /// Whether an ack `node_id` sent from `incarnation` may raise its grant's
+    /// acked index. Only the incarnation that asked for the grant holds the
+    /// promise the ack reports: an ack from an earlier incarnation, delivered
+    /// after a restart or same-term reset, would lift the clamp past what the
+    /// current incarnation promised.
+    pub(crate) fn ack_matches_grant(&self, node_id: u64, incarnation: u64) -> bool {
+        self.granted_lease(node_id)
+            .is_some_and(|rl| lease_incarnation(rl.lease_id) == incarnation)
+    }
+
+    /// The acked index a new grant to `node_id` starts from. A grant's acked
+    /// index only rises from what its own incarnation reported (its ask, its
+    /// acks, its `MsgAskAckIndexResp`) or from switch credits. `matched` is not
+    /// used: an ack from an earlier incarnation still advances it (SAFE-2). A
+    /// renewal from the same incarnation carries the current grant's acked
+    /// index forward, because the leader's clamp switches to the new grant
+    /// before the holder stops serving under the current one. Otherwise (a new
+    /// incarnation, or no grant left) `asked_index`, the asker's commit index,
+    /// is trivially safe; the leader asks for a fresher one if the clamp bites.
+    pub(crate) fn grant_acked_index(&self, node_id: u64, lease_id: u64, asked_index: u64) -> u64 {
+        match self.granted_lease(node_id) {
+            Some(cur) if lease_incarnation(cur.lease_id) == lease_incarnation(lease_id) => {
+                cmp::max(asked_index, cur.acked_index)
+            }
+            _ => asked_index,
+        }
+    }
+
     /// Whether this leader has granted `node_id` a lease that is still live.
     pub fn has_active_granted_lease(&mut self, node_id: u64) -> bool {
         self.option == ReadOnlyOption::GrantLeases
@@ -978,11 +1034,12 @@ impl ReadOnly {
         )
     }
 
-    /// Mints a fresh lease id (namespaced by `node_id`, the caller's own id) and
-    /// records its local start time in `pending_leases`.
-    pub fn get_marked_lease_id(&mut self, node_id: u64) -> u64 {
-        self.pending_lease_ctr += 1;
-        let id = ((node_id & 0xFFFF_FFFF) << 32) | (self.pending_lease_ctr & 0xFFFF_FFFF);
+    /// Mints a fresh lease id (this instance's incarnation in the upper 32 bits,
+    /// a counter in the lower 32) and records its local start time in
+    /// `pending_leases`.
+    pub fn get_marked_lease_id(&mut self) -> u64 {
+        self.pending_lease_ctr = self.pending_lease_ctr.wrapping_add(1);
+        let id = (self.incarnation << 32) | u64::from(self.pending_lease_ctr);
         self.pending_leases.insert(id, now_micros());
         id
     }
@@ -1112,7 +1169,7 @@ impl ReadOnly {
 
     /// This node's own read-lease ack index — the single authority for the
     /// follower serve gate and for what `MsgAskAckIndexResp` reports. Never
-    /// decreases within a term.
+    /// decreases within this `ReadOnly` instance (see `incarnation_id`).
     pub fn read_lease_acked_index(&self) -> u64 {
         self.read_lease_acked_index
     }
@@ -1328,7 +1385,7 @@ mod tests {
         assert_eq!(ro.read_lease_acked_index(), 250);
 
         // A renewal lands carrying the leader's stale view.
-        let lease_id = ro.get_marked_lease_id(node);
+        let lease_id = ro.get_marked_lease_id();
         let granted = ro.process_granted_lease(ReadLease {
             lease_id,
             node_id: node,
@@ -1370,7 +1427,7 @@ mod tests {
         );
 
         // The next grant must not walk it back to the leader's view.
-        let lease_id = ro.get_marked_lease_id(node);
+        let lease_id = ro.get_marked_lease_id();
         ro.process_granted_lease(ReadLease {
             lease_id,
             node_id: node,
@@ -1395,7 +1452,7 @@ mod tests {
         assert_eq!(ro.read_lease_acked_index(), 400);
 
         // A grant ahead of us does raise it.
-        let lease_id = ro.get_marked_lease_id(node);
+        let lease_id = ro.get_marked_lease_id();
         ro.process_granted_lease(ReadLease {
             lease_id,
             node_id: node,
@@ -1408,8 +1465,24 @@ mod tests {
         .expect("grant should have been installed");
         assert_eq!(ro.read_lease_acked_index(), 500);
 
-        // A term change discharges the promise along with the lease state.
+        // A rebuild (any `reset()`, same-term ones too) discharges the promise
+        // along with the lease state.
         let rebuilt = ReadOnly::new(ro.option, ro.lease_config.clone());
         assert_eq!(rebuilt.read_lease_acked_index(), 0);
+    }
+
+    // The lease-id counter wraps within the lower 32 bits instead of carrying
+    // into the incarnation (SAFE-2).
+    #[test]
+    fn test_lease_id_keeps_incarnation_on_wrap() {
+        let mut ro = ReadOnly::new(ReadOnlyOption::GrantLeases, ReadLeaseConfig::default());
+        let inc = ro.incarnation_id();
+        assert_ne!(inc, 0);
+        ro.pending_lease_ctr = u32::MAX - 1;
+        let a = ro.get_marked_lease_id();
+        let b = ro.get_marked_lease_id();
+        assert_ne!(a, b);
+        assert_eq!(lease_incarnation(a), inc);
+        assert_eq!(lease_incarnation(b), inc);
     }
 }

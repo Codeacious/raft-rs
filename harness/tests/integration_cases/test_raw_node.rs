@@ -600,6 +600,8 @@ fn test_raw_node_read_index() {
         // ReadOnlySafe: no lease involved.
         served_by_follower_lease: false,
         served_by_leader_lease: false,
+        // `new_raw_node` restores a term-1 snapshot; `campaign` moves to 2.
+        term: 2,
     }];
 
     let s = new_storage();
