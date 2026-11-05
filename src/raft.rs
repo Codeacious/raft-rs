@@ -1447,6 +1447,17 @@ impl<T: Storage> Raft<T> {
     /// when commit is close enough to catch up shortly, or forward it to the
     /// leader otherwise.
     fn serve_read_index_with_lease(&mut self, mut m: Message) {
+        // Only this node's own reads are served from its lease. A read another
+        // node forwarded here (its `leader_id` is stale) goes on to our leader,
+        // `from` intact, which answers that node directly. Served here, it
+        // would reach the requester as a plain `MsgReadIndexResp`, without the
+        // provenance TiKV keys its switch floor on, and a give-up replay's
+        // `m.index` was computed against the requester's lease, not ours
+        // (SAFE-5).
+        if m.from != INVALID_ID && m.from != self.id {
+            return self.forward_read_index(m);
+        }
+
         // A hint covers this term's credits only if this term's leader wrote
         // the switch register it came from: after a switch reboot, a deposed
         // leader's lower write can land first (SAFE-1). The switch carries the

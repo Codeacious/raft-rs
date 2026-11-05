@@ -122,8 +122,11 @@ fn step_hinted_read(node: &mut RawNode<MemStorage>, hint: u64) {
     step_hinted_read_at_term(node, hint, term);
 }
 
+/// Steps a locally issued read (`from` unset, as
+/// `RawNode::read_index_switch_hint` makes one): only those are served from
+/// the lease.
 fn step_hinted_read_at_term(node: &mut RawNode<MemStorage>, hint: u64, hint_term: u64) {
-    let mut m = new_message(2, 1, MessageType::MsgReadIndex, 0);
+    let mut m = new_message(0, 1, MessageType::MsgReadIndex, 0);
     m.commit = hint;
     m.log_term = hint_term;
     let mut e = Entry::default();
@@ -142,20 +145,23 @@ enum Outcome {
 fn outcome(node: &mut RawNode<MemStorage>) -> Outcome {
     let msgs: Vec<Message> = node.raft.msgs.drain(..).collect();
     let held = node.next_read_index_delay_micros().is_some();
+    let served = node.raft.read_states.drain(..).count();
     match (msgs.len(), held) {
-        (0, true) => Outcome::Held,
-        (1, false) if msgs[0].get_msg_type() == MessageType::MsgReadIndexResp => Outcome::Served,
+        (0, true) if served == 0 => Outcome::Held,
+        (0, false) if served == 1 => Outcome::Served,
         (1, false)
-            if msgs[0].get_msg_type() == MessageType::MsgReadIndex
+            if served == 0
+                && msgs[0].get_msg_type() == MessageType::MsgReadIndex
                 && msgs[0].to == node.raft.leader_id =>
         {
             Outcome::Forwarded
         }
         _ => panic!(
-            "unexpected outcome: {} msgs ({:?}), held={}",
+            "unexpected outcome: {} msgs ({:?}), held={}, served={}",
             msgs.len(),
             msgs,
-            held
+            held,
+            served
         ),
     }
 }
@@ -426,6 +432,122 @@ fn step_local_read(node: &mut RawNode<MemStorage>, ctx: &[u8], hint: u64, hint_t
     e.data = ctx.to_vec().into();
     m.set_entries(vec![e].into());
     node.step(m).expect("step local MsgReadIndex");
+}
+
+/// A follower serves only its own reads from its lease (SAFE-5). A read another
+/// node forwarded here (that node's `leader_id` is stale: this node led the
+/// term it was sent in, and now follows a later leader) is forwarded on to
+/// this node's leader, `from` intact, so the leader answers the requester
+/// directly. Served here, the answer would reach the requester as a plain
+/// `MsgReadIndexResp`, recorded with `served_by_follower_lease = false`, and
+/// TiKV would skip its switch floor for it.
+///
+/// The replay case is the one the SAFE-1 hint-term gate does not stop: a read
+/// the requester held and then gave up on arrives with `index` set and
+/// `reject`, and the `m.index` disjunct of the serve gate would admit it
+/// without consulting this node's acked index or the hint.
+#[test]
+fn test_remote_read_is_not_served_from_follower_lease() {
+    const TERM: u64 = 3;
+    const REQUESTER: u64 = 3;
+    let l = default_logger();
+    // (name, acked_index, commit, log_term, index, reject)
+    let cases: &[(&str, u64, u64, u64, u64, bool)] = &[
+        ("no hint", 5, 0, 0, 0, false),
+        ("no hint, acked ahead of committed", 20, 0, 0, 0, false),
+        ("hint at this term", 5, 5, TERM, 0, false),
+        (
+            "give-up replay from an earlier term",
+            5,
+            5,
+            TERM - 1,
+            5,
+            true,
+        ),
+        // Served before the fix only by the `m.index` disjunct.
+        (
+            "give-up replay, acked ahead of committed",
+            20,
+            0,
+            0,
+            5,
+            true,
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (name, acked_index, commit, log_term, index, reject) in cases {
+        let mut node = switch_hint_node_at(*acked_index, TERM, &l);
+        let mut m = new_message(REQUESTER, 1, MessageType::MsgReadIndex, 0);
+        m.commit = *commit;
+        m.log_term = *log_term;
+        m.index = *index;
+        m.reject = *reject;
+        let mut e = Entry::default();
+        e.data = b"remote".to_vec().into();
+        m.set_entries(vec![e].into());
+        node.step(m).expect("step remote MsgReadIndex");
+
+        let msgs: Vec<Message> = node.raft.msgs.drain(..).collect();
+        let forwarded = node.raft.read_states.is_empty()
+            && node.next_read_index_delay_micros().is_none()
+            && msgs.len() == 1
+            && msgs[0].get_msg_type() == MessageType::MsgReadIndex
+            && msgs[0].to == 2
+            // So the leader answers the requester.
+            && msgs[0].from == REQUESTER;
+        if !forwarded {
+            failed.push(format!(
+                "{}: held={} read_states={} msgs={:?}",
+                name,
+                node.next_read_index_delay_micros().is_some(),
+                node.raft.read_states.len(),
+                msgs
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "remote reads not forwarded to the leader:\n{}",
+        failed.join("\n")
+    );
+}
+
+/// The other side of SAFE-5: a read issued through the `RawNode` entry points
+/// TiKV uses (`read_index_switch_hint`, `read_index`, and `read_index_quorum`,
+/// which is an ordinary read off a leader) arrives with `from` unset, so the
+/// lease-holding follower serves it from its own lease rather than forwarding
+/// it as another node's read.
+#[test]
+fn test_raw_node_reads_are_served_from_follower_lease() {
+    let l = default_logger();
+    let reads: &[(&str, fn(&mut RawNode<MemStorage>))] = &[
+        ("read_index_switch_hint", |node| {
+            let term = node.raft.term;
+            node.read_index_switch_hint(b"api".to_vec(), 5, term)
+        }),
+        ("read_index", |node| node.read_index(b"api".to_vec())),
+        ("read_index_quorum", |node| {
+            node.read_index_quorum(b"api".to_vec())
+        }),
+    ];
+    for (name, read) in reads {
+        let mut node = switch_hint_node(5, &l);
+        read(&mut node);
+        let msgs: Vec<Message> = node.raft.msgs.drain(..).collect();
+        assert!(
+            msgs.is_empty(),
+            "{}: a local read sent messages: {:?}",
+            name,
+            msgs
+        );
+        assert_eq!(node.raft.read_states.len(), 1, "{}: not served here", name);
+        assert!(
+            node.raft.read_states[0].served_by_follower_lease,
+            "{}: not served from the follower lease",
+            name
+        );
+        assert_eq!(node.raft.read_states[0].index, COMMITTED, "{}", name);
+    }
 }
 
 /// `ReadState::term` is the term a follower read's index was produced in, on
