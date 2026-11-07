@@ -206,8 +206,24 @@ fn test_switch_hint_gate() {
 
     for (name, hint, acked_index, want) in cases {
         let mut node = switch_hint_node(*acked_index, &l);
+        let before = node.raft.read_only.read_lease_stats;
         step_hinted_read(&mut node, *hint);
         assert_eq!(&outcome(&mut node), want, "case {}", name);
+        // EXP-6: the stats a wrapper exports tell the three outcomes apart. A
+        // held read is decided (and counted as got/used) only when it is
+        // released.
+        let after = node.raft.read_only.read_lease_stats;
+        let got = (
+            after.times_got_read_query - before.times_got_read_query,
+            after.times_read_lease_used - before.times_read_lease_used,
+            after.times_read_held - before.times_read_held,
+        );
+        let expected = match want {
+            Outcome::Served => (1, 1, 0),
+            Outcome::Held => (0, 0, 1),
+            Outcome::Forwarded => (1, 0, 0),
+        };
+        assert_eq!(got, expected, "case {}: (got, used, held) stats", name);
     }
 }
 

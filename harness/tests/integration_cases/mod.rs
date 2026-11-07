@@ -1,7 +1,9 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 mod test_lagging_holder;
+mod test_lease_commit_bcast;
 mod test_lease_expiry;
+mod test_lease_idle;
 mod test_lease_incarnation;
 mod test_lease_read_failover;
 mod test_raft;

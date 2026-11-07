@@ -530,11 +530,53 @@ fn test_switch_credit_term_gate() {
         let mut nt = incarnation_group(false);
         let term = nt.peers[&1].term;
         let base = granted_acked(&nt, 2);
+        let accepted = nt.peers[&1]
+            .read_only
+            .read_lease_stats
+            .times_credit_accepted;
         let mut m = new_message(2, 1, MessageType::MsgAskAckIndexResp, 0);
         m.index = base + 1;
         m.log_term = log_term(term);
         nt.peers.get_mut(&1).unwrap().step(m).unwrap();
         let want = if counts { base + 1 } else { base };
         assert_eq!(granted_acked(&nt, 2), want, "{}", name);
+        // EXP-6 (review tack-08 F6): only a credit raft acted on is counted.
+        assert_eq!(
+            nt.peers[&1]
+                .read_only
+                .read_lease_stats
+                .times_credit_accepted
+                - accepted,
+            u64::from(counts),
+            "{}: accepted credits",
+            name
+        );
     }
+
+    // A credit for a node holding no grant (only 2 asks here) raises nothing
+    // and isn't counted: the case a wrapper's fed-credit count can't see.
+    let mut nt = incarnation_group(false);
+    let term = nt.peers[&1].term;
+    assert!(!nt
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .read_only
+        .has_active_granted_lease(3));
+    let accepted = nt.peers[&1]
+        .read_only
+        .read_lease_stats
+        .times_credit_accepted;
+    let mut m = new_message(3, 1, MessageType::MsgAskAckIndexResp, 0);
+    m.index = 100;
+    m.log_term = term;
+    nt.peers.get_mut(&1).unwrap().step(m).unwrap();
+    assert_eq!(
+        nt.peers[&1]
+            .read_only
+            .read_lease_stats
+            .times_credit_accepted,
+        accepted,
+        "a credit to a non-holder is not accepted"
+    );
 }

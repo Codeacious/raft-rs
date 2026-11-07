@@ -1421,6 +1421,9 @@ impl<T: Storage> Raft<T> {
             .leader
             .granted_leases
             .update_acked_index(m.from, m.index);
+        if m.term == 0 {
+            self.read_only.read_lease_stats.times_credit_accepted += 1;
+        }
 
         if old_index == min_before && self.maybe_commit() {
             self.bcast_append();
@@ -1439,6 +1442,13 @@ impl<T: Storage> Raft<T> {
             || self.state == StateRole::Leader
             || self.leader_id == INVALID_ID
         {
+            return false;
+        }
+        // An idle follower (no read of its own and no append with entries for
+        // the idle timeout) lets its lease lapse instead of renewing it, so an
+        // idle group goes quiet (EXP-12). A read marks use first, so a
+        // read-driven ask always passes.
+        if self.read_only.lease_renewal_idle() {
             return false;
         }
         let self_id = self.id;
@@ -1540,6 +1550,7 @@ impl<T: Storage> Raft<T> {
             .is_some_and(|d| d <= READ_INDEX_LOCAL_HOLD_LOG_THRESHOLD);
         if !m.reject && within_threshold {
             self.read_only.add_delayed_read_index_req(m, required);
+            self.read_only.mark_read_held_stat();
         } else {
             self.forward_read_index(m);
         }
@@ -3335,6 +3346,11 @@ impl<T: Storage> Raft<T> {
                     return Ok(());
                 }
                 if self.read_only.option == ReadOnlyOption::GrantLeases {
+                    // Only this node's own reads keep its lease renewing; a read
+                    // another node forwarded through here is not ours (EXP-12).
+                    if m.from == INVALID_ID || m.from == self.id {
+                        self.read_only.mark_lease_use();
+                    }
                     self.serve_read_index_with_lease(m);
                     // Fire on every read in GrantLeases mode, served or not.
                     // TODO: Make this toggleable.
@@ -3531,6 +3547,13 @@ impl<T: Storage> Raft<T> {
     // TODO: revoke pub when there is a better way to test.
     /// For a given message, append the entries to the log.
     pub fn handle_append_entries(&mut self, m: &Message) {
+        // A replicated write is lease use (EXP-12, review tack-08 F1): a
+        // write-only region keeps its holders, whose leases the commit clamp
+        // and switch credits act on. Heartbeats and commit-only appends don't
+        // count, so a region with neither reads nor writes still goes quiet.
+        if self.read_only.option == ReadOnlyOption::GrantLeases && !m.entries.is_empty() {
+            self.read_only.mark_lease_use();
+        }
         if self.pending_request_snapshot != INVALID_INDEX {
             self.send_request_snapshot();
             return;
@@ -3871,8 +3894,18 @@ impl<T: Storage> Raft<T> {
     }
 
     /// Specifies if the commit should be broadcast.
+    ///
+    /// Under `GrantLeases` it is, whatever `skip_bcast_commit` says, while any
+    /// follower holds a grant or has one parked (EXP-3). A holder serves a read
+    /// only once its own commit index reaches the read's bar (its acked index,
+    /// its grant's `log_index`, a switch hint), so a commit it learns only from
+    /// the next append forces its reads to wait or forward. Notifying commit is
+    /// always safe; it changes no lease rule.
     pub fn should_bcast_commit(&self) -> bool {
-        !self.skip_bcast_commit || self.has_pending_conf()
+        !self.skip_bcast_commit
+            || self.has_pending_conf()
+            || (self.read_only.option == ReadOnlyOption::GrantLeases
+                && self.read_only.leader.has_lease_holders())
     }
 
     /// Indicates whether state machine can be promoted to leader,

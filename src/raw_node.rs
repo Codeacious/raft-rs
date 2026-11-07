@@ -839,7 +839,10 @@ impl<T: Storage> RawNode<T> {
     /// poller thread. `Some(0)` = due now.
     ///
     /// - **Follower** (`GrantLeases`, asking for leases, leader known): when to
-    ///   (re)ask the leader for a lease.
+    ///   (re)ask the leader for a lease. `None` once it has gone
+    ///   `Config::read_lease_idle_timeout_micros` with neither a read of its
+    ///   own nor an append carrying entries: the lease lapses, and the next
+    ///   read asks.
     /// - **Leader** (either leased option): when to propose renewing its own
     ///   self-lease. `None` unless that lease has served a read since it
     ///   installed (a read proposes a renewal itself), or while this leader is
@@ -855,7 +858,7 @@ impl<T: Storage> RawNode<T> {
         if !self.is_asking_for_read_lease() || self.raft.leader_id == crate::INVALID_ID {
             return None;
         }
-        Some(self.raft.read_only.micros_until_lease_renewal())
+        self.raft.read_only.micros_until_lease_renewal()
     }
 
     /// Renews the lease this node holds if it is due. On a follower: asks the

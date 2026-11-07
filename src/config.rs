@@ -102,6 +102,18 @@ pub struct Config {
     /// considered caught up, when `read_only_option == GrantLeases`.
     pub read_lease_catchup_margin: u64,
 
+    /// How long, in microseconds, a lease-asking follower keeps renewing its
+    /// read lease with no use, when `read_only_option == GrantLeases`. Use is
+    /// a read of its own or an append carrying entries (a replicated write);
+    /// heartbeats don't count. A follower renews (on heartbeats and the
+    /// wrapper's renewal timer) only while it has seen use, or was (re)built,
+    /// within this window; past it the lease lapses, so a group with neither
+    /// reads nor writes exchanges no lease traffic and the wrapper may let it
+    /// go quiet (TiKV hibernation). A read always asks again. Liveness only:
+    /// a lapsed lease serves nothing. 0 renews forever, the behavior before
+    /// this knob.
+    pub read_lease_idle_timeout_micros: u64,
+
     /// Don't broadcast an empty raft entry to notify follower to commit an entry.
     /// This may make follower wait a longer time to apply an entry. This configuration
     /// May affect proposal forwarding and follower read.
@@ -147,6 +159,7 @@ impl Default for Config {
             max_num_read_leases: 5,
             ask_for_read_lease: false,
             read_lease_catchup_margin: 10,
+            read_lease_idle_timeout_micros: 10_000_000,
             skip_bcast_commit: false,
             batch_append: false,
             priority: 0,
@@ -175,6 +188,7 @@ impl Config {
             max_leases: self.max_num_read_leases,
             ask_for_lease: self.ask_for_read_lease,
             catchup_margin: self.read_lease_catchup_margin,
+            idle_timeout_micros: self.read_lease_idle_timeout_micros,
         }
     }
 

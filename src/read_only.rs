@@ -361,11 +361,24 @@ impl ReadLeaseMap {
     }
 }
 
-/// Counters surfaced to the wrapping DB (TiKV) for observability.
+/// Counters surfaced to the wrapping DB (TiKV) for observability. Under
+/// `GrantLeases` only, per `ReadOnly` instance (a `reset` zeroes them).
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ReadLeaseStats {
+    /// Reads served from this node's lease, at once or after a hold.
     pub times_read_lease_used: u64,
+    /// Reads decided: served from the lease or forwarded to the leader. A held
+    /// read counts once, when its hold ends.
     pub times_got_read_query: u64,
+    /// Reads held for commit to catch up before being decided (EXP-6): a
+    /// held read that is then served counts in `times_read_lease_used` too,
+    /// but waited up to the hold time first.
+    pub times_read_held: u64,
+    /// Leader side: switch credits (Term-0 `MsgAskAckIndexResp`) this leader
+    /// accepted, i.e. that passed the term check and found a grant to raise
+    /// (EXP-6, review tack-08 F6). A credit fed by the wrapper but dropped
+    /// here (no grant, another term) isn't counted.
+    pub times_credit_accepted: u64,
 }
 
 /// A `MsgReadIndex` a follower is holding locally instead of forwarding,
@@ -396,6 +409,10 @@ pub struct ReadLeaseConfig {
     pub ask_for_lease: bool,
     /// Catch-up margin in log indices (`Config::read_lease_catchup_margin`).
     pub catchup_margin: u64,
+    /// How long a follower keeps renewing with neither a local read nor an
+    /// append carrying entries (`Config::read_lease_idle_timeout_micros`); 0
+    /// renews forever.
+    pub idle_timeout_micros: u64,
 }
 
 /// A follower's lease request that a leader is holding until a majority returns
@@ -552,6 +569,13 @@ impl LeaderLeaseState {
     /// round.
     pub(crate) fn has_pending_proposals(&self) -> bool {
         self.pending_self_lease.is_some() || !self.pending_grants.is_empty()
+    }
+
+    /// Whether any follower holds a grant from this leader or has a request
+    /// parked for one (EXP-3). Grants are reaped lazily, so an expired grant
+    /// still counts until the next reap; `maybe_commit` reaps first.
+    pub(crate) fn has_lease_holders(&self) -> bool {
+        !self.granted_leases.leases.is_empty() || !self.pending_grants.is_empty()
     }
 
     /// Proposes a renewal of this leader's self-lease, dated now. It installs
@@ -718,6 +742,14 @@ pub struct ReadOnly {
     pub last_lease_asked: u64,
     /// Time (micros) this `ReadOnly` was created. Observability only.
     pub creation_time: u64,
+    /// When this node last saw lease use under `GrantLeases`: a read of its own
+    /// or an append carrying entries, or when this instance was built if
+    /// neither yet. A follower renews its lease only while this is within
+    /// `lease_config.idle_timeout_micros` (EXP-12). Appends count because a
+    /// region taking writes can't hibernate anyway, and its holders' leases
+    /// are what the commit clamp and switch credits act on (review tack-08
+    /// F1). Starting at build time keeps a new term's followers warm.
+    last_lease_use: u64,
     /// The lease *this* node holds, whatever its role: a follower's is granted
     /// by the leader, a leader's is its self-lease. Reads are served locally
     /// only while it is live, so one gate covers both roles.
@@ -750,9 +782,11 @@ impl ReadOnly {
     /// `ReadLeaseConfig::default()` when leases are irrelevant (the `Safe`
     /// option, or tests); a real Raft passes `Config::read_lease_config`.
     pub fn new(option: ReadOnlyOption, lease_config: ReadLeaseConfig) -> ReadOnly {
+        let now = now_micros();
         ReadOnly {
             option,
-            creation_time: now_micros(),
+            creation_time: now,
+            last_lease_use: now,
             lease_config,
             incarnation: rand::thread_rng().gen_range(1..=u64::from(u32::MAX >> 1)),
             ..Default::default()
@@ -1009,24 +1043,46 @@ impl ReadOnly {
         self.last_lease_asked = now_micros();
     }
 
+    /// Records lease use (EXP-12): a read of this node's own, or an append
+    /// carrying entries.
+    pub(crate) fn mark_lease_use(&mut self) {
+        self.last_lease_use = now_micros();
+    }
+
+    /// Whether this follower has gone `idle_timeout_micros` with neither a
+    /// read of its own nor an append carrying entries, so it should let its
+    /// lease lapse rather than renew it. A read marks use before it asks, so
+    /// read-driven asks are never idle. Heartbeats don't count.
+    pub(crate) fn lease_renewal_idle(&self) -> bool {
+        let timeout = self.lease_config.idle_timeout_micros;
+        timeout != 0 && now_micros().saturating_sub(self.last_lease_use) >= timeout
+    }
+
     /// Micros until this follower should next (re)ask the leader for a read
     /// lease, for the wrapper to arm a one-shot renewal timer on the poller
     /// thread. `0` = due now. This combines the renew-within-threshold rule
     /// (`maybe_ask_for_read_lease` asks once the lease is within
     /// `LEASE_RENEWAL_THRESHOLD_MICROS` of expiry) with the ask rate-limit, so a
     /// just-asked-but-not-yet-granted lease re-arms at the rate-limit interval
-    /// rather than spinning.
-    pub(crate) fn micros_until_lease_renewal(&mut self) -> u64 {
+    /// rather than spinning. `None` while this follower is idle
+    /// (`lease_renewal_idle`): nothing is due until a read or a write arrives;
+    /// a read asks itself, and a write re-arms the wrapper's timer (TiKV
+    /// re-reads this after every message batch), so the wrapper can leave its
+    /// timer disarmed.
+    pub(crate) fn micros_until_lease_renewal(&mut self) -> Option<u64> {
+        if self.lease_renewal_idle() {
+            return None;
+        }
         let until_expired = self.micros_until_held_lease_expired();
         let until_threshold = until_expired.saturating_sub(LEASE_RENEWAL_THRESHOLD_MICROS);
         if until_threshold > 0 {
             // Lease still comfortably valid; next check is when it nears expiry.
-            return until_threshold;
+            return Some(until_threshold);
         }
         // Within the renewal window (or no lease held): ask as soon as the
         // rate-limiter next permits.
         let since_asked = now_micros().saturating_sub(self.last_lease_asked);
-        LEASE_ASK_INTERVAL_MICROS.saturating_sub(since_asked)
+        Some(LEASE_ASK_INTERVAL_MICROS.saturating_sub(since_asked))
     }
 
     /// Micros until this leader should next try to renew its self-lease, for
@@ -1195,6 +1251,13 @@ impl ReadOnly {
     /// decreases within this `ReadOnly` instance (see `incarnation_id`).
     pub fn read_lease_acked_index(&self) -> u64 {
         self.read_lease_acked_index
+    }
+
+    /// Records that a read was held for commit to catch up (EXP-6).
+    pub(crate) fn mark_read_held_stat(&mut self) {
+        if self.option == ReadOnlyOption::GrantLeases {
+            self.read_lease_stats.times_read_held += 1;
+        }
     }
 
     pub fn mark_read_index_query_stat(&mut self, used: bool) {
@@ -1383,6 +1446,7 @@ mod tests {
                 max_leases: 5,
                 ask_for_lease: true,
                 catchup_margin: 10,
+                idle_timeout_micros: 0,
             },
         );
         ro.held_lease = Some(ReadLease {
@@ -1507,5 +1571,45 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(lease_incarnation(a), inc);
         assert_eq!(lease_incarnation(b), inc);
+    }
+
+    fn idle_follower(idle_timeout_micros: u64) -> ReadOnly {
+        ReadOnly::new(
+            ReadOnlyOption::GrantLeases,
+            ReadLeaseConfig {
+                duration_micros: 500_000,
+                max_leases: 5,
+                ask_for_lease: true,
+                catchup_margin: 10,
+                idle_timeout_micros,
+            },
+        )
+    }
+
+    // EXP-12: the renewal timer is due while the follower is warm (built or
+    // read within the idle timeout), and disarms (`None`) once it is idle; a
+    // local read makes it due again.
+    #[test]
+    fn test_renewal_timer_disarms_when_idle() {
+        let mut ro = idle_follower(20_000);
+        assert!(!ro.lease_renewal_idle(), "a new instance starts warm");
+        assert!(ro.micros_until_lease_renewal().is_some());
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(ro.lease_renewal_idle());
+        assert_eq!(ro.micros_until_lease_renewal(), None);
+
+        ro.mark_lease_use();
+        assert!(!ro.lease_renewal_idle());
+        assert!(ro.micros_until_lease_renewal().is_some());
+    }
+
+    // An idle timeout of 0 renews forever, as before the knob existed.
+    #[test]
+    fn test_zero_idle_timeout_never_idles() {
+        let mut ro = idle_follower(0);
+        ro.last_lease_use = 0;
+        assert!(!ro.lease_renewal_idle());
+        assert!(ro.micros_until_lease_renewal().is_some());
     }
 }
