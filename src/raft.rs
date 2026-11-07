@@ -1095,7 +1095,11 @@ impl<T: Storage> Raft<T> {
     /// lease before any successor's election. `grant_proposals_covered_by`
     /// answers it once that holds, and re-checks only the slot count.
     fn handle_ask_read_lease(&mut self, m: &Message) {
+        // Check 5 reads `committed`: bring it up to date with expired grants
+        // first.
+        self.maybe_commit_clamped();
         let committed = self.raft_log.committed;
+        let quorum_index = self.mut_prs().maximal_committed_index().0;
         let admissible = self.read_only.option == ReadOnlyOption::GrantLeases
             // 1. request is for the current term
             && self.term == m.term
@@ -1108,6 +1112,12 @@ impl<T: Storage> Raft<T> {
             && !self.read_only.leader.is_grant_banned(m.from)
             // 5. the follower's log is up to date (within the catch-up margin)
             && committed <= m.index.saturating_add(self.read_only.lease_config.catchup_margin)
+            // 5b. a holder's renewal: its grant is not pinning commit beyond
+            //     the margin. 5 cannot catch this, as the holder clamps
+            //     `committed` itself (LIVE-2)
+            && !self
+                .read_only
+                .renewal_pins_commit(m.from, m.log_term, quorum_index)
             // 6. a lease slot is free, or this follower already holds one
             && self.read_only.can_grant_lease_slot(m.from);
         if !admissible {
@@ -1380,8 +1390,23 @@ impl<T: Storage> Raft<T> {
             None => return,
         };
         // Term 0 is a switch credit injected by the application, which vouches
-        // for the holder's reads whatever its incarnation. A holder's own
-        // answer counts only from the incarnation that asked for this grant.
+        // for the holder's reads whatever its incarnation, but only in the term
+        // the switch register answered in (`log_term`, 32 bits as the switch
+        // carries it). The register's index rises only within a term; a newer
+        // term's write may lower it, so a credit from another term's register
+        // promises nothing about the stamps this term's reads will use. A
+        // holder's own answer counts only from the incarnation that asked for
+        // this grant.
+        if m.term == 0 && m.log_term as u32 != self.term as u32 {
+            info!(
+                self.logger,
+                "ignoring switch credit for {from}: register term {register_term} is not term {term}",
+                from = m.from,
+                register_term = m.log_term,
+                term = self.term;
+            );
+            return;
+        }
         if m.term != 0 && !self.read_only.ack_matches_grant(m.from, m.log_term) {
             info!(
                 self.logger,
@@ -1449,11 +1474,9 @@ impl<T: Storage> Raft<T> {
     fn serve_read_index_with_lease(&mut self, mut m: Message) {
         // Only this node's own reads are served from its lease. A read another
         // node forwarded here (its `leader_id` is stale) goes on to our leader,
-        // `from` intact, which answers that node directly. Served here, it
-        // would reach the requester as a plain `MsgReadIndexResp`, without the
-        // provenance TiKV keys its switch floor on, and a give-up replay's
-        // `m.index` was computed against the requester's lease, not ours
-        // (SAFE-5).
+        // `from` intact, which answers that node directly. Served here, a
+        // give-up replay's `m.index` would be one computed against the
+        // requester's lease, not ours (SAFE-5).
         if m.from != INVALID_ID && m.from != self.id {
             return self.forward_read_index(m);
         }
@@ -1758,9 +1781,6 @@ impl<T: Storage> Raft<T> {
         }
         // Send a round for anything still waiting (a lost round included).
         self.maybe_send_lease_round();
-        if self.msgs.len() > msgs_before {
-            has_ready = true;
-        }
 
         // Leased options: retry a commit the safeguard suppressed. Commit
         // otherwise only advances on an append response, and those are consumed
@@ -1775,7 +1795,39 @@ impl<T: Storage> Raft<T> {
             has_ready = true;
             self.bcast_append();
         }
+        if self.maybe_commit_clamped() {
+            has_ready = true;
+        }
+        // Checked last: a binding clamp that does not advance commit still
+        // emits `MsgAskAckIndex`, and TiKV collects a Ready after a tick only
+        // when this returns true.
+        if self.msgs.len() > msgs_before {
+            has_ready = true;
+        }
         has_ready
+    }
+
+    /// Re-runs `maybe_commit` while the read-lease clamp holds commit below the
+    /// quorum index (GrantLeases, after the term's first commit), and
+    /// broadcasts if commit advanced. A grant that stops pinning commit when it
+    /// expires drives no commit by itself: `maybe_commit` runs on acks, and
+    /// admission and lease lookups reap expired grants silently. Called from
+    /// `tick_heartbeat`, so an idle group's write commits within a tick of the
+    /// expiry, and before lease admission, so check 5 judges an asker against
+    /// the commit index the remaining grants allow rather than a stale clamped
+    /// one (LIVE-4; the LIVE-2 residual). TiKV's ReadLeaseExpiry timer
+    /// (`RawNode::expire_read_leases_and_maybe_commit`) narrows the first case
+    /// to the timer's latency but cannot close the second.
+    fn maybe_commit_clamped(&mut self) -> bool {
+        if self.read_only.option == ReadOnlyOption::GrantLeases
+            && self.commit_to_current_term()
+            && self.raft_log.committed < self.mut_prs().maximal_committed_index().0
+            && self.maybe_commit()
+        {
+            self.bcast_append();
+            return true;
+        }
+        false
     }
 
     /// Converts this node to a follower.

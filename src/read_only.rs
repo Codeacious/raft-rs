@@ -974,6 +974,29 @@ impl ReadOnly {
             || self.leader.granted_leases.has_active_lease(node_id)
     }
 
+    /// Whether an ask with `lease_id` renews a live grant to `node_id` whose
+    /// acked index is more than the catch-up margin below `quorum_index`. The
+    /// clamp must honor that grant until it expires, but renewing it would hold
+    /// commit below the quorum for another lease, indefinitely if the holder
+    /// never catches up (LIVE-2). An ask from a new incarnation is not a
+    /// renewal: the old grant's acked index is frozen (`ack_matches_grant`),
+    /// and the new grant replaces it.
+    pub(crate) fn renewal_pins_commit(
+        &mut self,
+        node_id: u64,
+        lease_id: u64,
+        quorum_index: u64,
+    ) -> bool {
+        if !self.leader.granted_leases.has_active_lease(node_id) {
+            return false;
+        }
+        let margin = self.lease_config.catchup_margin;
+        self.leader.granted_leases.get(node_id).is_some_and(|rl| {
+            lease_incarnation(rl.lease_id) == lease_incarnation(lease_id)
+                && quorum_index > rl.acked_index.saturating_add(margin)
+        })
+    }
+
     /// Whether the rate-limiter permits sending another `MsgAskReadLease`.
     pub fn can_ask_for_lease(&self) -> bool {
         if self.option != ReadOnlyOption::GrantLeases || !self.lease_config.ask_for_lease {

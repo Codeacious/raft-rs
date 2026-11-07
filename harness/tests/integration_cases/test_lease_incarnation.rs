@@ -505,10 +505,36 @@ fn test_ask_ack_index_resp_incarnation() {
     );
 
     let n1 = nt.peers.get_mut(&1).unwrap();
-    n1.step(ack_resp(base + 2, 0, 0)).unwrap();
+    n1.step(ack_resp(base + 2, 0, term)).unwrap();
     assert_eq!(
         granted_acked(&nt, 2),
         base + 2,
         "a Term-0 switch credit counts"
     );
+}
+
+/// A Term-0 switch credit counts only in the term the switch register answered
+/// in (`log_term`), compared modulo 2^32 as the switch carries it. The
+/// register's index rises only within a term, so a credit from another term's
+/// register says nothing about this term's stamps.
+#[test]
+fn test_switch_credit_term_gate() {
+    let cases: [(&str, fn(u64) -> u64, bool); 5] = [
+        ("this term", |t| t, true),
+        ("this term mod 2^32", |t| t + (1 << 32), true),
+        ("an earlier term", |t| t - 1, false),
+        ("a later term", |t| t + 1, false),
+        ("no term", |_| 0, false),
+    ];
+    for (name, log_term, counts) in cases {
+        let mut nt = incarnation_group(false);
+        let term = nt.peers[&1].term;
+        let base = granted_acked(&nt, 2);
+        let mut m = new_message(2, 1, MessageType::MsgAskAckIndexResp, 0);
+        m.index = base + 1;
+        m.log_term = log_term(term);
+        nt.peers.get_mut(&1).unwrap().step(m).unwrap();
+        let want = if counts { base + 1 } else { base };
+        assert_eq!(granted_acked(&nt, 2), want, "{}", name);
+    }
 }
